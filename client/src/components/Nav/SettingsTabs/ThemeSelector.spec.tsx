@@ -1,7 +1,9 @@
+import 'test/matchMedia.mock';
 import React from 'react';
 import { render, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom/extend-expect';
 import { ThemeSelector } from './General';
+import { RecoilRoot } from 'recoil';
 
 describe('ThemeSelector', () => {
   let mockOnChange;
@@ -12,7 +14,9 @@ describe('ThemeSelector', () => {
 
   it('renders correctly', () => {
     const { getByText, getByDisplayValue } = render(
-      <ThemeSelector theme="system" onChange={mockOnChange} />,
+      <RecoilRoot>
+        <ThemeSelector theme="system" onChange={mockOnChange} />
+      </RecoilRoot>,
     );
 
     expect(getByText('Theme')).toBeInTheDocument();
@@ -20,7 +24,11 @@ describe('ThemeSelector', () => {
   });
 
   it('calls onChange when the select value changes', () => {
-    const { getByDisplayValue } = render(<ThemeSelector theme="system" onChange={mockOnChange} />);
+    const { getByDisplayValue } = render(
+      <RecoilRoot>
+        <ThemeSelector theme="system" onChange={mockOnChange} />
+      </RecoilRoot>,
+    );
 
     fireEvent.change(getByDisplayValue('System'), { target: { value: 'dark' } });
 

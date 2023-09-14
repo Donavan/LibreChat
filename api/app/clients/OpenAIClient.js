@@ -5,8 +5,13 @@ const {
   get_encoding: getEncoding,
 } = require('@dqbd/tiktoken');
 const { maxTokensMap, genAzureChatCompletion } = require('../../utils');
+const { runTitleChain } = require('./chains');
+const { createLLM } = require('./llm');
 
+// Cache to store Tiktoken instances
 const tokenizersCache = {};
+// Counter for keeping track of the number of tokenizer calls
+let tokenizerCallsCount = 0;
 
 class OpenAIClient extends BaseClient {
   constructor(apiKey, options = {}) {
@@ -89,7 +94,6 @@ class OpenAIClient extends BaseClient {
     this.chatGptLabel = this.options.chatGptLabel || 'Assistant';
 
     this.setupTokens();
-    this.setupTokenizer();
 
     if (!this.modelOptions.stop) {
       const stopTokens = [this.startToken];
@@ -103,6 +107,7 @@ class OpenAIClient extends BaseClient {
 
     if (this.options.reverseProxyUrl) {
       this.completionsUrl = this.options.reverseProxyUrl;
+      this.langchainProxy = this.options.reverseProxyUrl.match(/.*v1/)[0];
     } else if (isChatGptModel) {
       this.completionsUrl = 'https://api.openai.com/v1/chat/completions';
     } else {
@@ -114,7 +119,7 @@ class OpenAIClient extends BaseClient {
     }
 
     if (this.azureEndpoint && this.options.debug) {
-      console.debug(`Using Azure endpoint: ${this.azureEndpoint}`, this.azure);
+      console.debug('Using Azure endpoint');
     }
 
     return this;
@@ -133,68 +138,87 @@ class OpenAIClient extends BaseClient {
     }
   }
 
-  setupTokenizer() {
+  // Selects an appropriate tokenizer based on the current configuration of the client instance.
+  // It takes into account factors such as whether it's a chat completion, an unofficial chat GPT model, etc.
+  selectTokenizer() {
+    let tokenizer;
     this.encoding = 'text-davinci-003';
     if (this.isChatCompletion) {
       this.encoding = 'cl100k_base';
-      this.gptEncoder = this.constructor.getTokenizer(this.encoding);
+      tokenizer = this.constructor.getTokenizer(this.encoding);
     } else if (this.isUnofficialChatGptModel) {
-      this.gptEncoder = this.constructor.getTokenizer(this.encoding, true, {
+      const extendSpecialTokens = {
         '<|im_start|>': 100264,
         '<|im_end|>': 100265,
-      });
+      };
+      tokenizer = this.constructor.getTokenizer(this.encoding, true, extendSpecialTokens);
     } else {
       try {
         this.encoding = this.modelOptions.model;
-        this.gptEncoder = this.constructor.getTokenizer(this.modelOptions.model, true);
+        tokenizer = this.constructor.getTokenizer(this.modelOptions.model, true);
       } catch {
-        this.gptEncoder = this.constructor.getTokenizer(this.encoding, true);
+        tokenizer = this.constructor.getTokenizer(this.encoding, true);
       }
     }
-  }
 
-  static getTokenizer(encoding, isModelName = false, extendSpecialTokens = {}) {
-    if (tokenizersCache[encoding]) {
-      return tokenizersCache[encoding];
-    }
-    let tokenizer;
-    if (isModelName) {
-      tokenizer = encodingForModel(encoding, extendSpecialTokens);
-    } else {
-      tokenizer = getEncoding(encoding, extendSpecialTokens);
-    }
-    tokenizersCache[encoding] = tokenizer;
     return tokenizer;
   }
 
-  freeAndResetEncoder() {
-    try {
-      if (!this.gptEncoder) {
-        return;
+  // Retrieves a tokenizer either from the cache or creates a new one if one doesn't exist in the cache.
+  // If a tokenizer is being created, it's also added to the cache.
+  static getTokenizer(encoding, isModelName = false, extendSpecialTokens = {}) {
+    let tokenizer;
+    if (tokenizersCache[encoding]) {
+      tokenizer = tokenizersCache[encoding];
+    } else {
+      if (isModelName) {
+        tokenizer = encodingForModel(encoding, extendSpecialTokens);
+      } else {
+        tokenizer = getEncoding(encoding, extendSpecialTokens);
       }
-      this.gptEncoder.free();
-      delete tokenizersCache[this.encoding];
-      delete tokenizersCache.count;
-      this.setupTokenizer();
+      tokenizersCache[encoding] = tokenizer;
+    }
+    return tokenizer;
+  }
+
+  // Frees all encoders in the cache and resets the count.
+  static freeAndResetAllEncoders() {
+    try {
+      Object.keys(tokenizersCache).forEach((key) => {
+        if (tokenizersCache[key]) {
+          tokenizersCache[key].free();
+          delete tokenizersCache[key];
+        }
+      });
+      // Reset count
+      tokenizerCallsCount = 1;
     } catch (error) {
-      console.log('freeAndResetEncoder error');
+      console.log('Free and reset encoders error');
       console.error(error);
     }
   }
 
-  getTokenCount(text) {
-    try {
-      if (tokenizersCache.count >= 25) {
-        if (this.options.debug) {
-          console.debug('freeAndResetEncoder: reached 25 encodings, reseting...');
-        }
-        this.freeAndResetEncoder();
+  // Checks if the cache of tokenizers has reached a certain size. If it has, it frees and resets all tokenizers.
+  resetTokenizersIfNecessary() {
+    if (tokenizerCallsCount >= 25) {
+      if (this.options.debug) {
+        console.debug('freeAndResetAllEncoders: reached 25 encodings, resetting...');
       }
-      tokenizersCache.count = (tokenizersCache.count || 0) + 1;
-      return this.gptEncoder.encode(text, 'all').length;
+      this.constructor.freeAndResetAllEncoders();
+    }
+    tokenizerCallsCount++;
+  }
+
+  // Returns the token count of a given text. It also checks and resets the tokenizers if necessary.
+  getTokenCount(text) {
+    this.resetTokenizersIfNecessary();
+    try {
+      const tokenizer = this.selectTokenizer();
+      return tokenizer.encode(text, 'all').length;
     } catch (error) {
-      this.freeAndResetEncoder();
-      return this.gptEncoder.encode(text, 'all').length;
+      this.constructor.freeAndResetAllEncoders();
+      const tokenizer = this.selectTokenizer();
+      return tokenizer.encode(text, 'all').length;
     }
   }
 
@@ -293,12 +317,18 @@ class OpenAIClient extends BaseClient {
   async sendCompletion(payload, opts = {}) {
     let reply = '';
     let result = null;
+    let streamResult = null;
+    this.modelOptions.user = this.user;
     if (typeof opts.onProgress === 'function') {
       await this.getCompletion(
         payload,
         (progressMessage) => {
           if (progressMessage === '[DONE]') {
             return;
+          }
+
+          if (progressMessage.choices) {
+            streamResult = progressMessage;
           }
           const token = this.isChatCompletion
             ? progressMessage.choices?.[0]?.delta?.content
@@ -334,6 +364,10 @@ class OpenAIClient extends BaseClient {
       }
     }
 
+    if (streamResult && typeof opts.addMetadata === 'function') {
+      const { finish_reason } = streamResult.choices[0];
+      opts.addMetadata({ finish_reason });
+    }
     return reply.trim();
   }
 
@@ -342,6 +376,64 @@ class OpenAIClient extends BaseClient {
       role: 'assistant',
       content: response.text,
     });
+  }
+
+  async titleConvo({ text, responseText = '' }) {
+    let title = 'New Chat';
+    const convo = `||>User:
+"${text}"
+||>Response:
+"${JSON.stringify(responseText)}"`;
+
+    const modelOptions = {
+      model: 'gpt-3.5-turbo-0613',
+      temperature: 0.2,
+      presence_penalty: 0,
+      frequency_penalty: 0,
+      max_tokens: 16,
+    };
+
+    const configOptions = {};
+
+    if (this.langchainProxy) {
+      configOptions.basePath = this.langchainProxy;
+    }
+
+    try {
+      const llm = createLLM({
+        modelOptions,
+        configOptions,
+        openAIApiKey: this.apiKey,
+        azure: this.azure,
+      });
+
+      title = await runTitleChain({ llm, text, convo });
+    } catch (e) {
+      console.error(e.message);
+      console.log('There was an issue generating title with LangChain, trying the old method...');
+      modelOptions.model = 'gpt-3.5-turbo';
+      const instructionsPayload = [
+        {
+          role: 'system',
+          content: `Detect user language and write in the same language an extremely concise title for this conversation, which you must accurately detect.
+Write in the detected language. Title in 5 Words or Less. No Punctuation or Quotation. Do not mention the language. All first letters of every word should be capitalized and write the title in User Language only.
+
+${convo}
+
+||>Title:`,
+        },
+      ];
+
+      try {
+        title = (await this.sendPayload(instructionsPayload, { modelOptions })).replaceAll('"', '');
+      } catch (e) {
+        console.error(e);
+        console.log('There was another issue generating the title, see error above.');
+      }
+    }
+
+    console.log('CONVERSATION TITLE', title);
+    return title;
   }
 }
 

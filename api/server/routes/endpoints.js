@@ -1,9 +1,58 @@
+const axios = require('axios');
 const express = require('express');
 const router = express.Router();
 const { availableTools } = require('../../app/clients/tools');
 const { addOpenAPISpecs } = require('../../app/clients/tools/util/addOpenAPISpecs');
+// const { getAzureCredentials, genAzureChatCompletion } = require('../../utils/');
 
-const getOpenAIModels = (opts = { azure: false }) => {
+const openAIApiKey = process.env.OPENAI_API_KEY;
+const azureOpenAIApiKey = process.env.AZURE_API_KEY;
+const useAzurePlugins = !!process.env.PLUGINS_USE_AZURE;
+const userProvidedOpenAI = useAzurePlugins
+  ? azureOpenAIApiKey === 'user_provided'
+  : openAIApiKey === 'user_provided';
+
+const fetchOpenAIModels = async (opts = { azure: false, plugins: false }, _models = []) => {
+  let models = _models.slice() ?? [];
+  let apiKey = openAIApiKey;
+  let basePath = 'https://api.openai.com/v1';
+  if (opts.azure) {
+    return models;
+    // const azure = getAzureCredentials();
+    // basePath = (genAzureChatCompletion(azure))
+    //   .split('/deployments')[0]
+    //   .concat(`/models?api-version=${azure.azureOpenAIApiVersion}`);
+    // apiKey = azureOpenAIApiKey;
+  }
+
+  const reverseProxyUrl = process.env.OPENAI_REVERSE_PROXY;
+  if (reverseProxyUrl) {
+    basePath = reverseProxyUrl.match(/.*v1/)[0];
+  }
+
+  if (basePath.includes('v1') || opts.azure) {
+    try {
+      const res = await axios.get(`${basePath}${opts.azure ? '' : '/models'}`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+      });
+
+      models = res.data.data.map((item) => item.id);
+      // console.log(`Fetched ${models.length} models from ${opts.azure ? 'Azure ' : ''}OpenAI API`);
+    } catch (err) {
+      console.log(`Failed to fetch models from ${opts.azure ? 'Azure ' : ''}OpenAI API`);
+    }
+  }
+
+  if (!reverseProxyUrl) {
+    const regex = /(text-davinci-003|gpt-)/;
+    models = models.filter((model) => regex.test(model));
+  }
+  return models;
+};
+
+const getOpenAIModels = async (opts = { azure: false, plugins: false }) => {
   let models = [
     'gpt-4',
     'gpt-4-0613',
@@ -11,13 +60,31 @@ const getOpenAIModels = (opts = { azure: false }) => {
     'gpt-3.5-turbo-16k',
     'gpt-3.5-turbo-0613',
     'gpt-3.5-turbo-0301',
-    'text-davinci-003',
   ];
-  const key = opts.azure ? 'AZURE_OPENAI_MODELS' : 'OPENAI_MODELS';
-  if (process.env[key]) {
-    models = String(process.env[key]).split(',');
+
+  if (!opts.plugins) {
+    models.push('text-davinci-003');
   }
 
+  let key;
+  if (opts.azure) {
+    key = 'AZURE_OPENAI_MODELS';
+  } else if (opts.plugins) {
+    key = 'PLUGIN_MODELS';
+  } else {
+    key = 'OPENAI_MODELS';
+  }
+
+  if (process.env[key]) {
+    models = String(process.env[key]).split(',');
+    return models;
+  }
+
+  if (userProvidedOpenAI) {
+    return models;
+  }
+
+  models = await fetchOpenAIModels(opts, models);
   return models;
 };
 
@@ -44,22 +111,6 @@ const getAnthropicModels = () => {
   return models;
 };
 
-const getPluginModels = () => {
-  let models = [
-    'gpt-4',
-    'gpt-4-0613',
-    'gpt-3.5-turbo',
-    'gpt-3.5-turbo-16k',
-    'gpt-3.5-turbo-0613',
-    'gpt-3.5-turbo-0301',
-  ];
-  if (process.env.PLUGIN_MODELS) {
-    models = String(process.env.PLUGIN_MODELS).split(',');
-  }
-
-  return models;
-};
-
 let i = 0;
 router.get('/', async function (req, res) {
   let key, palmUser;
@@ -67,7 +118,6 @@ router.get('/', async function (req, res) {
     key = require('../../data/auth.json');
   } catch (e) {
     if (i === 0) {
-      console.log('No \'auth.json\' file (service account key) found in /api/data/ for PaLM models');
       i++;
     }
   }
@@ -75,7 +125,6 @@ router.get('/', async function (req, res) {
   if (process.env.PALM_KEY === 'user_provided') {
     palmUser = true;
     if (i <= 1) {
-      console.log('User will provide key for PaLM models');
       i++;
     }
   }
@@ -93,31 +142,30 @@ router.get('/', async function (req, res) {
     key || palmUser
       ? { userProvide: palmUser, availableModels: ['chat-bison', 'text-bison', 'codechat-bison'] }
       : false;
-  const openAIApiKey = process.env.OPENAI_API_KEY;
-  const azureOpenAIApiKey = process.env.AZURE_API_KEY;
-  const userProvidedOpenAI = openAIApiKey
-    ? openAIApiKey === 'user_provided'
-    : azureOpenAIApiKey === 'user_provided';
   const openAI = openAIApiKey
-    ? { availableModels: getOpenAIModels(), userProvide: openAIApiKey === 'user_provided' }
+    ? { availableModels: await getOpenAIModels(), userProvide: openAIApiKey === 'user_provided' }
     : false;
   const azureOpenAI = azureOpenAIApiKey
     ? {
-      availableModels: getOpenAIModels({ azure: true }),
+      availableModels: await getOpenAIModels({ azure: true }),
       userProvide: azureOpenAIApiKey === 'user_provided',
     }
     : false;
   const gptPlugins =
     openAIApiKey || azureOpenAIApiKey
       ? {
-        availableModels: getPluginModels(),
+        availableModels: await getOpenAIModels({ azure: useAzurePlugins, plugins: true }),
         plugins,
         availableAgents: ['classic', 'functions'],
         userProvide: userProvidedOpenAI,
+        azure: useAzurePlugins,
       }
       : false;
   const bingAI = process.env.BINGAI_TOKEN
-    ? { userProvide: process.env.BINGAI_TOKEN == 'user_provided' }
+    ? {
+      availableModels: ['BingAI', 'Sydney'],
+      userProvide: process.env.BINGAI_TOKEN == 'user_provided',
+    }
     : false;
   const chatGPTBrowser = process.env.CHATGPT_TOKEN
     ? {

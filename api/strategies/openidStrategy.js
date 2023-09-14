@@ -67,13 +67,15 @@ async function setupOpenId() {
             fullName = userinfo.given_name;
           } else if (userinfo.family_name) {
             fullName = userinfo.family_name;
+          } else {
+            fullName = userinfo.username || userinfo.email;
           }
 
           if (!user) {
             user = new User({
               provider: 'openid',
               openidId: userinfo.sub,
-              username: userinfo.given_name || '',
+              username: userinfo.username || userinfo.given_name || '',
               email: userinfo.email || '',
               emailVerified: userinfo.email_verified || false,
               name: fullName,
@@ -81,7 +83,7 @@ async function setupOpenId() {
           } else {
             user.provider = 'openid';
             user.openidId = userinfo.sub;
-            user.username = userinfo.given_name || '';
+            user.username = userinfo.username || userinfo.given_name || '';
             user.name = fullName;
           }
 
