@@ -1,12 +1,15 @@
-const express = require('express');
-const mongoSanitize = require('express-mongo-sanitize');
-const { connectDb, indexSync } = require('../lib/db');
 const path = require('path');
+require('module-alias')({ base: path.resolve(__dirname, '..') });
 const cors = require('cors');
-const routes = require('./routes');
-const errorController = require('./controllers/ErrorController');
+const express = require('express');
 const passport = require('passport');
+const mongoSanitize = require('express-mongo-sanitize');
+const errorController = require('./controllers/ErrorController');
 const configureSocialLogins = require('./socialLogins');
+const { connectDb, indexSync } = require('../lib/db');
+const config = require('../config');
+const routes = require('./routes');
+
 const { PORT, HOST, ALLOW_SOCIAL_LOGIN } = process.env ?? {};
 
 const port = Number(PORT) || 3080;
@@ -20,6 +23,7 @@ const startServer = async () => {
   await indexSync();
 
   const app = express();
+  app.locals.config = config;
 
   // Middleware
   app.use(errorController);
@@ -60,9 +64,12 @@ const startServer = async () => {
   app.use('/api/prompts', routes.prompts);
   app.use('/api/tokenizer', routes.tokenizer);
   app.use('/api/endpoints', routes.endpoints);
+  app.use('/api/balance', routes.balance);
   app.use('/api/models', routes.models);
   app.use('/api/plugins', routes.plugins);
   app.use('/api/config', routes.config);
+  app.use('/api/assistants', routes.assistants);
+  app.use('/api/files', routes.files);
 
   // Static files
   app.get('/*', function (req, res) {
@@ -94,7 +101,16 @@ process.on('uncaughtException', (err) => {
       console.error('Meilisearch error, search will be disabled');
       messageCount++;
     }
-  } else {
-    process.exit(1);
+
+    return;
   }
+
+  if (err.message.includes('OpenAIError')) {
+    console.error(
+      '\n\nAn Uncaught `OpenAIError` error may be due to your reverse-proxy setup or stream configuration, or a bug in the `openai` node package.',
+    );
+    return;
+  }
+
+  process.exit(1);
 });

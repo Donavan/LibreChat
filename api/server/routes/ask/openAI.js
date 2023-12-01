@@ -1,9 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const { getResponseSender } = require('../endpoints/schemas');
-const { sendMessage, createOnProgress } = require('../../utils');
-const { addTitle, initializeClient } = require('../endpoints/openAI');
-const { saveMessage, getConvoTitle, getConvo } = require('../../../models');
+const { sendMessage, createOnProgress } = require('~/server/utils');
+const { saveMessage, getConvoTitle, getConvo } = require('~/models');
+const { getResponseSender } = require('~/server/routes/endpoints/schemas');
+const { addTitle, initializeClient } = require('~/server/routes/endpoints/openAI');
 const {
   handleAbort,
   createAbortController,
@@ -11,7 +11,7 @@ const {
   setHeaders,
   validateEndpoint,
   buildEndpointOption,
-} = require('../../middleware');
+} = require('~/server/middleware');
 
 router.post('/abort', handleAbort());
 
@@ -27,21 +27,29 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
   console.dir({ text, conversationId, endpointOption }, { depth: null });
   let metadata;
   let userMessage;
+  let promptTokens;
   let userMessageId;
   let responseMessageId;
   let lastSavedTimestamp = 0;
   let saveDelay = 100;
+  const sender = getResponseSender({ ...endpointOption, model: endpointOption.modelOptions.model });
   const newConvo = !conversationId;
   const user = req.user.id;
 
   const addMetadata = (data) => (metadata = data);
 
-  const getIds = (data) => {
-    userMessage = data.userMessage;
-    userMessageId = userMessage.messageId;
-    responseMessageId = data.responseMessageId;
-    if (!conversationId) {
-      conversationId = data.conversationId;
+  const getReqData = (data = {}) => {
+    for (let key in data) {
+      if (key === 'userMessage') {
+        userMessage = data[key];
+        userMessageId = data[key].messageId;
+      } else if (key === 'responseMessageId') {
+        responseMessageId = data[key];
+      } else if (key === 'promptTokens') {
+        promptTokens = data[key];
+      } else if (!conversationId && key === 'conversationId') {
+        conversationId = data[key];
+      }
     }
   };
 
@@ -53,7 +61,7 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
         lastSavedTimestamp = currentTimestamp;
         saveMessage({
           messageId: responseMessageId,
-          sender: getResponseSender(endpointOption),
+          sender,
           conversationId,
           parentMessageId: overrideParentMessageId ?? userMessageId,
           text: partialText,
@@ -72,25 +80,25 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
   });
 
   const getAbortData = () => ({
-    sender: getResponseSender(endpointOption),
+    sender,
     conversationId,
     messageId: responseMessageId,
     parentMessageId: overrideParentMessageId ?? userMessageId,
     text: getPartialText(),
     userMessage,
+    promptTokens,
   });
 
   const { abortController, onStart } = createAbortController(req, res, getAbortData);
 
   try {
-    const { client } = await initializeClient(req, endpointOption);
-
-    let response = await client.sendMessage(text, {
+    const { client } = await initializeClient({ req, res, endpointOption });
+    const messageOptions = {
       user,
       parentMessageId,
       conversationId,
       overrideParentMessageId,
-      getIds,
+      getReqData,
       onStart,
       addMetadata,
       abortController,
@@ -99,7 +107,9 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
         text,
         parentMessageId: overrideParentMessageId || userMessageId,
       }),
-    });
+    };
+
+    let response = await client.sendMessage(text, messageOptions);
 
     if (overrideParentMessageId) {
       response.parentMessageId = overrideParentMessageId;
@@ -109,12 +119,10 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
       response = { ...response, ...metadata };
     }
 
-    console.log(
-      'promptTokens, completionTokens:',
-      response.promptTokens,
-      response.completionTokens,
-    );
-    await saveMessage({ ...response, user });
+    if (client.options.attachments) {
+      userMessage.files = client.options.attachments;
+      delete userMessage.image_urls;
+    }
 
     sendMessage(res, {
       title: await getConvoTitle(user, conversationId),
@@ -125,7 +133,10 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
     });
     res.end();
 
-    if (parentMessageId == '00000000-0000-0000-0000-000000000000' && newConvo) {
+    await saveMessage({ ...response, user });
+    await saveMessage(userMessage);
+
+    if (parentMessageId === '00000000-0000-0000-0000-000000000000' && newConvo) {
       addTitle(req, {
         text,
         response,
@@ -137,7 +148,7 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
     handleAbortError(res, req, error, {
       partialText,
       conversationId,
-      sender: getResponseSender(endpointOption),
+      sender,
       messageId: responseMessageId,
       parentMessageId: userMessageId ?? parentMessageId,
     });

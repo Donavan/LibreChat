@@ -1,5 +1,10 @@
-import type { TResPlugin, TMessage, TConversation, TEndpointOption } from './schemas';
+import OpenAI from 'openai';
 import type { UseMutationResult } from '@tanstack/react-query';
+import type { TResPlugin, TMessage, TConversation, TEndpointOption } from './schemas';
+
+export type TOpenAIMessage = OpenAI.Chat.ChatCompletionMessageParam;
+export type TOpenAIFunction = OpenAI.Chat.ChatCompletionCreateParams.Function;
+export type TOpenAIFunctionCall = OpenAI.Chat.ChatCompletionCreateParams.FunctionCallOption;
 
 export type TMutation = UseMutationResult<unknown>;
 
@@ -19,7 +24,7 @@ export type TSubmission = {
   isRegenerate?: boolean;
   conversationId?: string;
   initialResponse: TMessage;
-  conversation: TConversation;
+  conversation: Partial<TConversation>;
   endpointOption: TEndpointOption;
 };
 
@@ -115,13 +120,14 @@ export type TConfig = {
   availableModels?: [];
   userProvide?: boolean | null;
   availableTools?: [];
-  plugins?: [];
+  plugins?: Record<string, string>;
   azure?: boolean;
+  order: number;
 };
 
 export type TModelsConfig = Record<string, string[]>;
 
-export type TEndpointsConfig = Record<string, TConfig | null>;
+export type TEndpointsConfig = Record<string, TConfig>;
 
 export type TUpdateTokenCountResponse = {
   count: number;
@@ -175,6 +181,8 @@ export type TStartupConfig = {
   registrationEnabled: boolean;
   socialLoginEnabled: boolean;
   emailEnabled: boolean;
+  checkBalance: boolean;
+  customFooter?: string;
 };
 
 export type TRefreshTokenResponse = {

@@ -1,7 +1,8 @@
 const crypto = require('crypto');
 const TextStream = require('./TextStream');
-const { getConvo, getMessages, saveMessage, updateMessage, saveConvo } = require('../../models');
-const { addSpaceIfNeeded } = require('../../server/utils');
+const { getConvo, getMessages, saveMessage, updateMessage, saveConvo } = require('~/models');
+const { addSpaceIfNeeded, isEnabled } = require('~/server/utils');
+const checkBalance = require('~/models/checkBalance');
 
 class BaseClient {
   constructor(apiKey, options = {}) {
@@ -39,6 +40,18 @@ class BaseClient {
     throw new Error('Subclasses attempted to call summarizeMessages without implementing it');
   }
 
+  async getTokenCountForResponse(response) {
+    if (this.options.debug) {
+      console.debug('`recordTokenUsage` not implemented.', response);
+    }
+  }
+
+  async recordTokenUsage({ promptTokens, completionTokens }) {
+    if (this.options.debug) {
+      console.debug('`recordTokenUsage` not implemented.', { promptTokens, completionTokens });
+    }
+  }
+
   getBuildMessagesOptions() {
     throw new Error('Subclasses must implement getBuildMessagesOptions');
   }
@@ -49,7 +62,7 @@ class BaseClient {
   }
 
   async setMessageOptions(opts = {}) {
-    if (opts && typeof opts === 'object') {
+    if (opts && opts.replaceOptions) {
       this.setOptions(opts);
     }
 
@@ -64,6 +77,7 @@ class BaseClient {
     let responseMessageId = opts.responseMessageId ?? crypto.randomUUID();
     let head = isEdited ? responseMessageId : parentMessageId;
     this.currentMessages = (await this.loadHistory(conversationId, head)) ?? [];
+    this.conversationId = conversationId;
 
     if (isEdited && !isContinued) {
       responseMessageId = crypto.randomUUID();
@@ -114,8 +128,8 @@ class BaseClient {
         text: message,
       });
 
-    if (typeof opts?.getIds === 'function') {
-      opts.getIds({
+    if (typeof opts?.getReqData === 'function') {
+      opts.getReqData({
         userMessage,
         conversationId,
         responseMessageId,
@@ -403,6 +417,7 @@ class BaseClient {
       // this only matters when buildMessages is utilizing the parentMessageId, and may vary on implementation
       isEdited ? head : userMessage.messageId,
       this.getBuildMessagesOptions(opts),
+      opts,
     );
 
     if (tokenCountMap) {
@@ -420,6 +435,21 @@ class BaseClient {
       await this.saveMessageToDatabase(userMessage, saveOptions, user);
     }
 
+    if (isEnabled(process.env.CHECK_BALANCE)) {
+      await checkBalance({
+        req: this.options.req,
+        res: this.options.res,
+        txData: {
+          user: this.user,
+          tokenType: 'prompt',
+          amount: promptTokens,
+          debug: this.options.debug,
+          model: this.modelOptions.model,
+        },
+      });
+    }
+
+    const completion = await this.sendCompletion(payload, opts);
     const responseMessage = {
       messageId: responseMessageId,
       conversationId,
@@ -428,13 +458,19 @@ class BaseClient {
       isEdited,
       model: this.modelOptions.model,
       sender: this.sender,
-      text: addSpaceIfNeeded(generation) + (await this.sendCompletion(payload, opts)),
+      text: addSpaceIfNeeded(generation) + completion,
       promptTokens,
     };
 
-    if (tokenCountMap && this.getTokenCountForResponse) {
+    if (
+      tokenCountMap &&
+      this.recordTokenUsage &&
+      this.getTokenCountForResponse &&
+      this.getTokenCount
+    ) {
       responseMessage.tokenCount = this.getTokenCountForResponse(responseMessage);
-      responseMessage.completionTokens = responseMessage.tokenCount;
+      const completionTokens = this.getTokenCount(completion);
+      await this.recordTokenUsage({ promptTokens, completionTokens });
     }
     await this.saveMessageToDatabase(responseMessage, saveOptions, user);
     delete responseMessage.tokenCount;
@@ -601,14 +637,27 @@ class BaseClient {
       tokensPerName = -1;
     }
 
+    const processValue = (value) => {
+      if (typeof value === 'object' && value !== null) {
+        for (let [nestedKey, nestedValue] of Object.entries(value)) {
+          if (nestedKey === 'image_url' || nestedValue === 'image_url') {
+            continue;
+          }
+          processValue(nestedValue);
+        }
+      } else {
+        numTokens += this.getTokenCount(value);
+      }
+    };
+
     let numTokens = tokensPerMessage;
     for (let [key, value] of Object.entries(message)) {
-      numTokens += this.getTokenCount(value);
+      processValue(value);
+
       if (key === 'name') {
         numTokens += tokensPerName;
       }
     }
-
     return numTokens;
   }
 

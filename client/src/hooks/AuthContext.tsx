@@ -24,7 +24,7 @@ import useTimeout from './useTimeout';
 const AuthContext = createContext<TAuthContext | undefined>(undefined);
 
 const AuthContextProvider = ({
-  // authConfig,
+  authConfig,
   children,
 }: {
   authConfig?: TAuthConfig;
@@ -65,7 +65,7 @@ const AuthContextProvider = ({
     loginUser.mutate(data, {
       onSuccess: (data: TLoginResponse) => {
         const { user, token } = data;
-        setUserContext({ token, isAuthenticated: true, user, redirect: '/chat/new' });
+        setUserContext({ token, isAuthenticated: true, user, redirect: '/c/new' });
       },
       onError: (error: TResError | unknown) => {
         const resError = error as TResError;
@@ -98,6 +98,10 @@ const AuthContextProvider = ({
   }, [setUserContext, doSetError, logoutUser]);
 
   const silentRefresh = useCallback(() => {
+    if (authConfig?.test) {
+      console.log('Test mode. Skipping silent refresh.');
+      return;
+    }
     refreshToken.mutate(undefined, {
       onSuccess: (data: TLoginResponse) => {
         const { user, token } = data;
@@ -105,11 +109,17 @@ const AuthContextProvider = ({
           setUserContext({ token, isAuthenticated: true, user });
         } else {
           console.log('Token is not present. User is not authenticated.');
+          if (authConfig?.test) {
+            return;
+          }
           navigate('/login');
         }
       },
       onError: (error) => {
         console.log('refreshToken mutation error:', error);
+        if (authConfig?.test) {
+          return;
+        }
         navigate('/login');
       },
     });

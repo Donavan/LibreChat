@@ -9,9 +9,9 @@ const {
   setHeaders,
   validateEndpoint,
   buildEndpointOption,
-} = require('../../middleware');
-const { saveMessage, getConvoTitle, saveConvo, getConvo } = require('../../../models');
-const { sendMessage, createOnProgress } = require('../../utils');
+} = require('~/server/middleware');
+const { saveMessage, getConvoTitle, getConvo } = require('~/models');
+const { sendMessage, createOnProgress } = require('~/server/utils');
 
 router.post('/abort', handleAbort());
 
@@ -26,18 +26,26 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
   console.log('ask log');
   console.dir({ text, conversationId, endpointOption }, { depth: null });
   let userMessage;
+  let promptTokens;
   let userMessageId;
   let responseMessageId;
   let lastSavedTimestamp = 0;
   let saveDelay = 100;
+  const sender = getResponseSender({ ...endpointOption, model: endpointOption.modelOptions.model });
   const user = req.user.id;
 
-  const getIds = (data) => {
-    userMessage = data.userMessage;
-    userMessageId = data.userMessage.messageId;
-    responseMessageId = data.responseMessageId;
-    if (!conversationId) {
-      conversationId = data.conversationId;
+  const getReqData = (data = {}) => {
+    for (let key in data) {
+      if (key === 'userMessage') {
+        userMessage = data[key];
+        userMessageId = data[key].messageId;
+      } else if (key === 'responseMessageId') {
+        responseMessageId = data[key];
+      } else if (key === 'promptTokens') {
+        promptTokens = data[key];
+      } else if (!conversationId && key === 'conversationId') {
+        conversationId = data[key];
+      }
     }
   };
 
@@ -49,7 +57,7 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
         lastSavedTimestamp = currentTimestamp;
         saveMessage({
           messageId: responseMessageId,
-          sender: getResponseSender(endpointOption),
+          sender,
           conversationId,
           parentMessageId: overrideParentMessageId ?? userMessageId,
           text: partialText,
@@ -69,18 +77,19 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
     const getAbortData = () => ({
       conversationId,
       messageId: responseMessageId,
-      sender: getResponseSender(endpointOption),
+      sender,
       parentMessageId: overrideParentMessageId ?? userMessageId,
       text: getPartialText(),
       userMessage,
+      promptTokens,
     });
 
     const { abortController, onStart } = createAbortController(req, res, getAbortData);
 
-    const { client } = await initializeClient(req, endpointOption);
+    const { client } = await initializeClient({ req, res, endpointOption });
 
     let response = await client.sendMessage(text, {
-      getIds,
+      getReqData,
       // debug: true,
       user,
       conversationId,
@@ -100,14 +109,6 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
       response.parentMessageId = overrideParentMessageId;
     }
 
-    await saveConvo(user, {
-      ...endpointOption,
-      ...endpointOption.modelOptions,
-      conversationId,
-      endpoint: 'anthropic',
-    });
-
-    await saveMessage({ ...response, user });
     sendMessage(res, {
       title: await getConvoTitle(user, conversationId),
       final: true,
@@ -117,13 +118,16 @@ router.post('/', validateEndpoint, buildEndpointOption, setHeaders, async (req, 
     });
     res.end();
 
+    await saveMessage({ ...response, user });
+    await saveMessage(userMessage);
+
     // TODO: add anthropic titling
   } catch (error) {
     const partialText = getPartialText();
     handleAbortError(res, req, error, {
       partialText,
       conversationId,
-      sender: getResponseSender(endpointOption),
+      sender,
       messageId: responseMessageId,
       parentMessageId: userMessageId ?? parentMessageId,
     });

@@ -15,8 +15,9 @@ const {
   HttpRequestTool,
   OpenAICreateImage,
   StableDiffusionAPI,
+  DALLE3,
   StructuredSD,
-  AzureCognitiveSearch,
+  AzureAISearch,
   StructuredACS,
   E2BTools,
   CodeSherpa,
@@ -100,7 +101,7 @@ const loadTools = async ({
     wolfram: functions ? StructuredWolfram : WolframAlphaAPI,
     'dall-e': OpenAICreateImage,
     'stable-diffusion': functions ? StructuredSD : StableDiffusionAPI,
-    'azure-cognitive-search': functions ? StructuredACS : AzureCognitiveSearch,
+    'azure-ai-search': functions ? StructuredACS : AzureAISearch,
     CodeBrew: CodeBrew,
   };
 
@@ -176,6 +177,7 @@ const loadTools = async ({
   const requestedTools = {};
 
   if (functions) {
+    toolConstructors.dalle = DALLE3;
     toolConstructors.codesherpa = CodeSherpa;
   }
 
@@ -225,6 +227,7 @@ const loadTools = async ({
       user,
       message: options.message,
       memory: options.memory,
+      signal: options.signal,
       tools: remainingTools,
       map: true,
       verbose: false,
