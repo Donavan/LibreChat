@@ -13,6 +13,16 @@ import { useEffect } from 'react';
 const conversationByIndex = atomFamily<TConversation | null, string | number>({
   key: 'conversationByIndex',
   default: null,
+  effects: [
+    ({ onSet, node }) => {
+      onSet(async (newValue: TConversation | null) => {
+        const index = Number(node.key.split('__')[1]);
+        if (newValue?.assistant_id) {
+          localStorage.setItem(`assistant_id__${index}`, newValue.assistant_id);
+        }
+      });
+    },
+  ] as const,
 });
 
 const filesByIndex = atomFamily<Map<string, ExtendedFile>, string | number>({
@@ -46,6 +56,11 @@ const submissionByIndex = atomFamily<TSubmission | null, string | number>({
 const textByIndex = atomFamily<string, string | number>({
   key: 'textByIndex',
   default: '',
+});
+
+const showStopButtonByIndex = atomFamily<boolean, string | number>({
+  key: 'showStopButtonByIndex',
+  default: false,
 });
 
 const abortScrollFamily = atomFamily({
@@ -83,11 +98,6 @@ const latestMessageFamily = atomFamily<TMessage | null, string | number | null>(
   default: null,
 });
 
-const textareaHeightFamily = atomFamily<number, string | number>({
-  key: 'textareaHeightByIndex',
-  default: 56,
-});
-
 function useCreateConversationAtom(key: string | number) {
   const [keys, setKeys] = useRecoilState(conversationKeysAtom);
   const setConversation = useSetRecoilState(conversationByIndex(key));
@@ -108,6 +118,7 @@ export default {
   presetByIndex,
   submissionByIndex,
   textByIndex,
+  showStopButtonByIndex,
   abortScrollFamily,
   isSubmittingFamily,
   optionSettingsFamily,
@@ -115,7 +126,6 @@ export default {
   showBingToneSettingFamily,
   showPopoverFamily,
   latestMessageFamily,
-  textareaHeightFamily,
   allConversationsSelector,
   useCreateConversationAtom,
 };
