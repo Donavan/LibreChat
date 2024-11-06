@@ -1,9 +1,15 @@
 import { useEffect } from 'react';
 import { Search, X } from 'lucide-react';
-import { Dialog } from '@headlessui/react';
+import { Dialog, DialogPanel, DialogTitle, Description } from '@headlessui/react';
 import { useFormContext } from 'react-hook-form';
+import { isAgentsEndpoint } from 'librechat-data-provider';
 import { useUpdateUserPluginsMutation } from 'librechat-data-provider/react-query';
-import type { TError, TPluginAction } from 'librechat-data-provider';
+import type {
+  AssistantsEndpoint,
+  EModelEndpoint,
+  TPluginAction,
+  TError,
+} from 'librechat-data-provider';
 import type { TPluginStoreDialogProps } from '~/common/types';
 import { PluginPagination, PluginAuthForm } from '~/components/Plugins/Store';
 import { useLocalize, usePluginDialogHelpers } from '~/hooks';
@@ -12,11 +18,17 @@ import ToolItem from './ToolItem';
 
 function ToolSelectDialog({
   isOpen,
+  endpoint,
   setIsOpen,
-}: TPluginStoreDialogProps & { assistant_id?: string }) {
+  toolsFormKey,
+}: TPluginStoreDialogProps & {
+  toolsFormKey: string;
+  endpoint: AssistantsEndpoint | EModelEndpoint.agents;
+}) {
   const localize = useLocalize();
   const { getValues, setValue } = useFormContext();
-  const { data: tools = [] } = useAvailableToolsQuery();
+  const { data: tools } = useAvailableToolsQuery(endpoint);
+  const isAgentTools = isAgentsEndpoint(endpoint);
 
   const {
     maxPage,
@@ -44,8 +56,9 @@ function ToolSelectDialog({
   const updateUserPlugins = useUpdateUserPluginsMutation();
   const handleInstallError = (error: TError) => {
     setError(true);
-    if (error.response?.data?.message) {
-      setErrorMessage(error.response?.data?.message);
+    const errorMessage = error.response?.data?.message ?? '';
+    if (errorMessage) {
+      setErrorMessage(errorMessage);
     }
     setTimeout(() => {
       setError(false);
@@ -55,9 +68,9 @@ function ToolSelectDialog({
 
   const handleInstall = (pluginAction: TPluginAction) => {
     const addFunction = () => {
-      const fns = getValues('functions').slice();
+      const fns = getValues(toolsFormKey).slice();
       fns.push(pluginAction.pluginKey);
-      setValue('functions', fns);
+      setValue(toolsFormKey, fns);
     };
 
     if (!pluginAction.auth) {
@@ -77,14 +90,14 @@ function ToolSelectDialog({
   const onRemoveTool = (tool: string) => {
     setShowPluginAuthForm(false);
     updateUserPlugins.mutate(
-      { pluginKey: tool, action: 'uninstall', auth: null, isAssistantTool: true },
+      { pluginKey: tool, action: 'uninstall', auth: null, isEntityTool: true },
       {
         onError: (error: unknown) => {
           handleInstallError(error as TError);
         },
         onSuccess: () => {
-          const fns = getValues('functions').filter((fn) => fn !== tool);
-          setValue('functions', fns);
+          const fns = getValues(toolsFormKey).filter((fn: string) => fn !== tool);
+          setValue(toolsFormKey, fns);
         },
       },
     );
@@ -95,7 +108,7 @@ function ToolSelectDialog({
     const getAvailablePluginFromKey = tools?.find((p) => p.pluginKey === pluginKey);
     setSelectedPlugin(getAvailablePluginFromKey);
 
-    const { authConfig, authenticated } = getAvailablePluginFromKey ?? {};
+    const { authConfig, authenticated = false } = getAvailablePluginFromKey ?? {};
 
     if (authConfig && authConfig.length > 0 && !authenticated) {
       setShowPluginAuthForm(true);
@@ -141,19 +154,21 @@ function ToolSelectDialog({
       <div className="fixed inset-0 bg-gray-600/65 transition-opacity dark:bg-black/80" />
       {/* Full-screen container to center the panel */}
       <div className="fixed inset-0 flex items-center justify-center p-4">
-        <Dialog.Panel
+        <DialogPanel
           className="relative w-full transform overflow-hidden overflow-y-auto rounded-lg bg-white text-left shadow-xl transition-all dark:bg-gray-800 max-sm:h-full sm:mx-7 sm:my-8 sm:max-w-2xl lg:max-w-5xl xl:max-w-7xl"
           style={{ minHeight: '610px' }}
         >
           <div className="flex items-center justify-between border-b-[1px] border-black/10 px-4 pb-4 pt-5 dark:border-white/10 sm:p-6">
             <div className="flex items-center">
               <div className="text-center sm:text-left">
-                <Dialog.Title className="text-lg font-medium leading-6 text-gray-900 dark:text-gray-200">
-                  {localize('com_nav_tool_dialog')}
-                </Dialog.Title>
-                <Dialog.Description className="text-sm text-gray-500 dark:text-gray-300">
+                <DialogTitle className="text-lg font-medium leading-6 text-gray-900 dark:text-gray-200">
+                  {isAgentTools
+                    ? localize('com_nav_tool_dialog_agents')
+                    : localize('com_nav_tool_dialog')}
+                </DialogTitle>
+                <Description className="text-sm text-gray-500 dark:text-gray-300">
                   {localize('com_nav_tool_dialog_description')}
-                </Dialog.Description>
+                </Description>
               </div>
             </div>
             <div>
@@ -184,7 +199,7 @@ function ToolSelectDialog({
               <PluginAuthForm
                 plugin={selectedPlugin}
                 onSubmit={(installActionData: TPluginAction) => handleInstall(installActionData)}
-                isAssistantTool={true}
+                isEntityTool={true}
               />
             </div>
           )}
@@ -212,7 +227,7 @@ function ToolSelectDialog({
                       <ToolItem
                         key={index}
                         tool={tool}
-                        isInstalled={getValues('functions').includes(tool.pluginKey)}
+                        isInstalled={getValues(toolsFormKey).includes(tool.pluginKey)}
                         onAddTool={() => onAddTool(tool.pluginKey)}
                         onRemoveTool={() => onRemoveTool(tool.pluginKey)}
                       />
@@ -231,7 +246,7 @@ function ToolSelectDialog({
               )}
             </div>
           </div>
-        </Dialog.Panel>
+        </DialogPanel>
       </div>
     </Dialog>
   );

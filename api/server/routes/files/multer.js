@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const multer = require('multer');
 const { fileConfig: defaultFileConfig, mergeFileConfig } = require('librechat-data-provider');
-const getCustomConfig = require('~/server/services/Config/getCustomConfig');
+const { getCustomConfig } = require('~/server/services/Config');
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -19,6 +19,16 @@ const storage = multer.diskStorage({
     cb(null, `${file.originalname}`);
   },
 });
+
+const importFileFilter = (req, file, cb) => {
+  if (file.mimetype === 'application/json') {
+    cb(null, true);
+  } else if (path.extname(file.originalname).toLowerCase() === '.json') {
+    cb(null, true);
+  } else {
+    cb(new Error('Only JSON files are allowed'), false);
+  }
+};
 
 const fileFilter = (req, file, cb) => {
   if (!file) {
@@ -42,4 +52,4 @@ const createMulterInstance = async () => {
   });
 };
 
-module.exports = createMulterInstance;
+module.exports = { createMulterInstance, storage, importFileFilter };

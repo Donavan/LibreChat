@@ -3,16 +3,14 @@ const { v4 } = require('uuid');
 const {
   Constants,
   ContentTypes,
-  EModelEndpoint,
   AnnotationTypes,
   defaultOrderQuery,
 } = require('librechat-data-provider');
 const { retrieveAndProcessFile } = require('~/server/services/Files/process');
 const { recordMessage, getMessages } = require('~/models/Message');
+const { countTokens, escapeRegExp } = require('~/server/utils');
+const { spendTokens } = require('~/models/spendTokens');
 const { saveConvo } = require('~/models/Conversation');
-const spendTokens = require('~/models/spendTokens');
-const { countTokens } = require('~/server/utils');
-const { logger } = require('~/config');
 
 /**
  * Initializes a new thread or adds messages to an existing thread.
@@ -42,6 +40,7 @@ async function initThread({ openai, body, thread_id: _thread_id }) {
 /**
  * Saves a user message to the DB in the Assistants endpoint format.
  *
+ * @param {Object} req - The request object.
  * @param {Object} params - The parameters of the user message
  * @param {string} params.user - The user's ID.
  * @param {string} params.text - The user's prompt.
@@ -50,6 +49,7 @@ async function initThread({ openai, body, thread_id: _thread_id }) {
  * @param {string} params.assistant_id - The current assistant Id.
  * @param {string} params.thread_id - The thread Id.
  * @param {string} params.conversationId - The message's conversationId
+ * @param {string} params.endpoint - The conversation endpoint
  * @param {string} [params.parentMessageId] - Optional if initial message.
  * Defaults to Constants.NO_PARENT.
  * @param {string} [params.instructions] - Optional: from preset for `instructions` field.
@@ -59,7 +59,7 @@ async function initThread({ openai, body, thread_id: _thread_id }) {
  * @param {string[]} [params.file_ids] - Optional. List of File IDs attached to the userMessage.
  * @return {Promise<Run>} A promise that resolves to the created run object.
  */
-async function saveUserMessage(params) {
+async function saveUserMessage(req, params) {
   const tokenCount = await countTokens(params.text);
 
   // todo: do this on the frontend
@@ -82,7 +82,7 @@ async function saveUserMessage(params) {
 
   const userMessage = {
     user: params.user,
-    endpoint: EModelEndpoint.assistants,
+    endpoint: params.endpoint,
     messageId: params.messageId,
     conversationId: params.conversationId,
     parentMessageId: params.parentMessageId ?? Constants.NO_PARENT,
@@ -96,7 +96,7 @@ async function saveUserMessage(params) {
   };
 
   const convo = {
-    endpoint: EModelEndpoint.assistants,
+    endpoint: params.endpoint,
     conversationId: params.conversationId,
     promptPrefix: params.promptPrefix,
     instructions: params.instructions,
@@ -110,42 +110,38 @@ async function saveUserMessage(params) {
   }
 
   const message = await recordMessage(userMessage);
-  await saveConvo(params.user, convo);
-
+  await saveConvo(req, convo, {
+    context: 'api/server/services/Threads/manage.js #saveUserMessage',
+  });
   return message;
 }
 
 /**
  * Saves an Assistant message to the DB in the Assistants endpoint format.
  *
+ * @param {Object} req - The request object.
  * @param {Object} params - The parameters of the Assistant message
  * @param {string} params.user - The user's ID.
  * @param {string} params.messageId - The message Id.
+ * @param {string} params.text - The concatenated text of the message.
  * @param {string} params.assistant_id - The assistant Id.
  * @param {string} params.thread_id - The thread Id.
  * @param {string} params.model - The model used by the assistant.
  * @param {ContentPart[]} params.content - The message content parts.
  * @param {string} params.conversationId - The message's conversationId
+ * @param {string} params.endpoint - The conversation endpoint
  * @param {string} params.parentMessageId - The latest user message that triggered this response.
  * @param {string} [params.instructions] - Optional: from preset for `instructions` field.
  * Overrides the instructions of the assistant.
  * @param {string} [params.promptPrefix] - Optional: from preset for `additional_instructions` field.
  * @return {Promise<Run>} A promise that resolves to the created run object.
  */
-async function saveAssistantMessage(params) {
-  const text = params.content.reduce((acc, part) => {
-    if (!part.value) {
-      return acc;
-    }
-
-    return acc + ' ' + part.value;
-  }, '');
-
+async function saveAssistantMessage(req, params) {
   // const tokenCount = // TODO: need to count each content part
 
   const message = await recordMessage({
     user: params.user,
-    endpoint: EModelEndpoint.assistants,
+    endpoint: params.endpoint,
     messageId: params.messageId,
     conversationId: params.conversationId,
     parentMessageId: params.parentMessageId,
@@ -155,18 +151,23 @@ async function saveAssistantMessage(params) {
     content: params.content,
     sender: 'Assistant',
     isCreatedByUser: false,
-    text: text.trim(),
+    text: params.text,
+    unfinished: false,
     // tokenCount,
   });
 
-  await saveConvo(params.user, {
-    endpoint: EModelEndpoint.assistants,
-    conversationId: params.conversationId,
-    promptPrefix: params.promptPrefix,
-    instructions: params.instructions,
-    assistant_id: params.assistant_id,
-    model: params.model,
-  });
+  await saveConvo(
+    req,
+    {
+      endpoint: params.endpoint,
+      conversationId: params.conversationId,
+      promptPrefix: params.promptPrefix,
+      instructions: params.instructions,
+      assistant_id: params.assistant_id,
+      model: params.model,
+    },
+    { context: 'api/server/services/Threads/manage.js #saveAssistantMessage' },
+  );
 
   return message;
 }
@@ -205,20 +206,22 @@ async function addThreadMetadata({ openai, thread_id, messageId, messages }) {
  *
  * @param {Object} params - The parameters for synchronizing messages.
  * @param {OpenAIClient} params.openai - The OpenAI client instance.
+ * @param {string} params.endpoint - The current endpoint.
+ * @param {string} params.thread_id - The current thread ID.
  * @param {TMessage[]} params.dbMessages - The LibreChat DB messages.
  * @param {ThreadMessage[]} params.apiMessages - The thread messages from the API.
- * @param {string} params.conversationId - The current conversation ID.
- * @param {string} params.thread_id - The current thread ID.
  * @param {string} [params.assistant_id] - The current assistant ID.
+ * @param {string} params.conversationId - The current conversation ID.
  * @return {Promise<TMessage[]>} A promise that resolves to the updated messages
  */
 async function syncMessages({
   openai,
-  apiMessages,
-  dbMessages,
-  conversationId,
+  endpoint,
   thread_id,
+  dbMessages,
+  apiMessages,
   assistant_id,
+  conversationId,
 }) {
   let result = [];
   let dbMessageMap = new Map(dbMessages.map((msg) => [msg.messageId, msg]));
@@ -290,7 +293,7 @@ async function syncMessages({
         thread_id,
         conversationId,
         messageId: v4(),
-        endpoint: EModelEndpoint.assistants,
+        endpoint,
         parentMessageId: lastMessage ? lastMessage.messageId : Constants.NO_PARENT,
         role: apiMessage.role,
         isCreatedByUser: apiMessage.role === 'user',
@@ -299,6 +302,7 @@ async function syncMessages({
         aggregateMessages: [{ id: apiMessage.id }],
         model: apiMessage.role === 'user' ? null : apiMessage.assistant_id,
         user: openai.req.user.id,
+        unfinished: false,
       };
 
       if (apiMessage.file_ids?.length) {
@@ -340,10 +344,14 @@ async function syncMessages({
   await Promise.all(modifyPromises);
   await Promise.all(recordPromises);
 
-  await saveConvo(openai.req.user.id, {
-    conversationId,
-    file_ids: attached_file_ids,
-  });
+  await saveConvo(
+    openai.req,
+    {
+      conversationId,
+      file_ids: attached_file_ids,
+    },
+    { context: 'api/server/services/Threads/manage.js #syncMessages' },
+  );
 
   return result;
 }
@@ -382,13 +390,21 @@ function mapMessagesToSteps(steps, messages) {
  *
  * @param {Object} params - The parameters for initializing a thread.
  * @param {OpenAIClient} params.openai - The OpenAI client instance.
+ * @param {string} params.endpoint - The current endpoint.
  * @param {string} [params.latestMessageId] - Optional: The latest message ID from LibreChat.
  * @param {string} params.thread_id - Response thread ID.
  * @param {string} params.run_id - Response Run ID.
  * @param {string} params.conversationId - LibreChat conversation ID.
  * @return {Promise<TMessage[]>} A promise that resolves to the updated messages
  */
-async function checkMessageGaps({ openai, latestMessageId, thread_id, run_id, conversationId }) {
+async function checkMessageGaps({
+  openai,
+  endpoint,
+  latestMessageId,
+  thread_id,
+  run_id,
+  conversationId,
+}) {
   const promises = [];
   promises.push(openai.beta.threads.messages.list(thread_id, defaultOrderQuery));
   promises.push(openai.beta.threads.runs.steps.list(thread_id, run_id));
@@ -406,6 +422,7 @@ async function checkMessageGaps({ openai, latestMessageId, thread_id, run_id, co
     role: 'assistant',
     run_id,
     thread_id,
+    endpoint,
     metadata: {
       messageId: latestMessageId,
     },
@@ -452,11 +469,12 @@ async function checkMessageGaps({ openai, latestMessageId, thread_id, run_id, co
 
   const syncedMessages = await syncMessages({
     openai,
+    endpoint,
+    thread_id,
     dbMessages,
     apiMessages,
-    thread_id,
-    conversationId,
     assistant_id,
+    conversationId,
   });
 
   return Object.values(
@@ -497,59 +515,26 @@ const recordUsage = async ({
   );
 };
 
-/**
- * Safely replaces the annotated text within the specified range denoted by start_index and end_index,
- * after verifying that the text within that range matches the given annotation text.
- * Proceeds with the replacement even if a mismatch is found, but logs a warning.
- *
- * @param {string} originalText The original text content.
- * @param {number} start_index The starting index where replacement should begin.
- * @param {number} end_index The ending index where replacement should end.
- * @param {string} expectedText The text expected to be found in the specified range.
- * @param {string} replacementText The text to insert in place of the existing content.
- * @returns {string} The text with the replacement applied, regardless of text match.
- */
-function replaceAnnotation(originalText, start_index, end_index, expectedText, replacementText) {
-  if (start_index < 0 || end_index > originalText.length || start_index > end_index) {
-    logger.warn(`Invalid range specified for annotation replacement.
-    Attempting replacement with \`replace\` method instead...
-    length: ${originalText.length}
-    start_index: ${start_index}
-    end_index: ${end_index}`);
-    return originalText.replace(originalText, replacementText);
-  }
-
-  const actualTextInRange = originalText.substring(start_index, end_index);
-
-  if (actualTextInRange !== expectedText) {
-    logger.warn(`The text within the specified range does not match the expected annotation text.
-    Attempting replacement with \`replace\` method instead...
-    Expected: ${expectedText}
-    Actual: ${actualTextInRange}`);
-
-    return originalText.replace(originalText, replacementText);
-  }
-
-  const beforeText = originalText.substring(0, start_index);
-  const afterText = originalText.substring(end_index);
-  return beforeText + replacementText + afterText;
-}
+const uniqueCitationStart = '^====||===';
+const uniqueCitationEnd = '==|||||^';
 
 /**
  * Sorts, processes, and flattens messages to a single string.
  *
- * @param {object} params - The OpenAI client instance.
+ * @param {object} params - The parameters for processing messages.
  * @param {OpenAIClient} params.openai - The OpenAI client instance.
  * @param {RunClient} params.client - The LibreChat client that manages the run: either refers to `OpenAI` or `StreamRunManager`.
  * @param {ThreadMessage[]} params.messages - An array of messages.
- * @returns {Promise<{messages: ThreadMessage[], text: string}>} The sorted messages and the flattened text.
+ * @returns {Promise<{messages: ThreadMessage[], text: string, edited: boolean}>} The sorted messages, the flattened text, and whether it was edited.
  */
 async function processMessages({ openai, client, messages = [] }) {
   const sorted = messages.sort((a, b) => a.created_at - b.created_at);
 
   let text = '';
   let edited = false;
-  const sources = [];
+  const sources = new Map();
+  const fileRetrievalPromises = [];
+
   for (const message of sorted) {
     message.files = [];
     for (const content of message.content) {
@@ -558,15 +543,21 @@ async function processMessages({ openai, client, messages = [] }) {
       const currentFileId = contentType?.file_id;
 
       if (type === ContentTypes.IMAGE_FILE && !client.processedFileIds.has(currentFileId)) {
-        const file = await retrieveAndProcessFile({
-          openai,
-          client,
-          file_id: currentFileId,
-          basename: `${currentFileId}.png`,
-        });
-
-        client.processedFileIds.add(currentFileId);
-        message.files.push(file);
+        fileRetrievalPromises.push(
+          retrieveAndProcessFile({
+            openai,
+            client,
+            file_id: currentFileId,
+            basename: `${currentFileId}.png`,
+          })
+            .then((file) => {
+              client.processedFileIds.add(currentFileId);
+              message.files.push(file);
+            })
+            .catch((error) => {
+              console.error(`Failed to retrieve file: ${error.message}`);
+            }),
+        );
         continue;
       }
 
@@ -575,71 +566,110 @@ async function processMessages({ openai, client, messages = [] }) {
       /** @type {{ annotations: Annotation[] }} */
       const { annotations } = contentType ?? {};
 
-      // Process annotations if they exist
       if (!annotations?.length) {
-        text += currentText + ' ';
+        text += currentText;
         continue;
       }
 
-      logger.debug('[processMessages] Processing annotations:', annotations);
-      for (const annotation of annotations) {
-        let file;
+      const replacements = [];
+      const annotationPromises = annotations.map(async (annotation) => {
         const type = annotation.type;
         const annotationType = annotation[type];
         const file_id = annotationType?.file_id;
         const alreadyProcessed = client.processedFileIds.has(file_id);
 
-        const replaceCurrentAnnotation = (replacement = '') => {
-          currentText = replaceAnnotation(
-            currentText,
-            annotation.start_index,
-            annotation.end_index,
-            annotation.text,
-            replacement,
-          );
-          edited = true;
-        };
+        let file;
+        let replacementText = '';
 
-        if (alreadyProcessed) {
-          const { file_id } = annotationType || {};
-          file = await retrieveAndProcessFile({ openai, client, file_id, unknownType: true });
-        } else if (type === AnnotationTypes.FILE_PATH) {
-          const basename = path.basename(annotation.text);
-          file = await retrieveAndProcessFile({
-            openai,
-            client,
-            file_id,
-            basename,
-          });
-          replaceCurrentAnnotation(file.filepath);
-        } else if (type === AnnotationTypes.FILE_CITATION) {
-          file = await retrieveAndProcessFile({
-            openai,
-            client,
-            file_id,
-            unknownType: true,
-          });
-          sources.push(file.filename);
-          replaceCurrentAnnotation(`^${sources.length}^`);
+        try {
+          if (alreadyProcessed) {
+            file = await retrieveAndProcessFile({ openai, client, file_id, unknownType: true });
+          } else if (type === AnnotationTypes.FILE_PATH) {
+            const basename = path.basename(annotation.text);
+            file = await retrieveAndProcessFile({
+              openai,
+              client,
+              file_id,
+              basename,
+            });
+            replacementText = file.filepath;
+          } else if (type === AnnotationTypes.FILE_CITATION && file_id) {
+            file = await retrieveAndProcessFile({
+              openai,
+              client,
+              file_id,
+              unknownType: true,
+            });
+            if (file && file.filename) {
+              if (!sources.has(file.filename)) {
+                sources.set(file.filename, sources.size + 1);
+              }
+              replacementText = `${uniqueCitationStart}${sources.get(
+                file.filename,
+              )}${uniqueCitationEnd}`;
+            }
+          }
+
+          if (file && replacementText) {
+            replacements.push({
+              start: annotation.start_index,
+              end: annotation.end_index,
+              text: replacementText,
+            });
+            edited = true;
+            if (!alreadyProcessed) {
+              client.processedFileIds.add(file_id);
+              message.files.push(file);
+            }
+          }
+        } catch (error) {
+          console.error(`Failed to process annotation: ${error.message}`);
         }
+      });
 
-        text += currentText + ' ';
+      await Promise.all(annotationPromises);
 
-        if (!file) {
-          continue;
-        }
-
-        client.processedFileIds.add(file_id);
-        message.files.push(file);
+      // Apply replacements in reverse order
+      replacements.sort((a, b) => b.start - a.start);
+      for (const { start, end, text: replacementText } of replacements) {
+        currentText = currentText.slice(0, start) + replacementText + currentText.slice(end);
       }
+
+      text += currentText;
     }
   }
 
-  if (sources.length) {
+  await Promise.all(fileRetrievalPromises);
+
+  // Handle adjacent identical citations with the unique format
+  const adjacentCitationRegex = new RegExp(
+    `${escapeRegExp(uniqueCitationStart)}(\\d+)${escapeRegExp(
+      uniqueCitationEnd,
+    )}(\\s*)${escapeRegExp(uniqueCitationStart)}(\\d+)${escapeRegExp(uniqueCitationEnd)}`,
+    'g',
+  );
+  text = text.replace(adjacentCitationRegex, (match, num1, space, num2) => {
+    return num1 === num2
+      ? `${uniqueCitationStart}${num1}${uniqueCitationEnd}`
+      : `${uniqueCitationStart}${num1}${uniqueCitationEnd}${space}${uniqueCitationStart}${num2}${uniqueCitationEnd}`;
+  });
+
+  // Remove any remaining adjacent identical citations
+  const remainingAdjacentRegex = new RegExp(
+    `(${escapeRegExp(uniqueCitationStart)}(\\d+)${escapeRegExp(uniqueCitationEnd)})\\s*\\1+`,
+    'g',
+  );
+  text = text.replace(remainingAdjacentRegex, '$1');
+
+  // Replace the unique citation format with the final format
+  text = text.replace(new RegExp(escapeRegExp(uniqueCitationStart), 'g'), '^');
+  text = text.replace(new RegExp(escapeRegExp(uniqueCitationEnd), 'g'), '^');
+
+  if (sources.size) {
     text += '\n\n';
-    for (let i = 0; i < sources.length; i++) {
-      text += `^${i + 1}.^ ${sources[i]}${i === sources.length - 1 ? '' : '\n'}`;
-    }
+    Array.from(sources.entries()).forEach(([source, index], arrayIndex) => {
+      text += `^${index}.^ ${source}${arrayIndex === sources.size - 1 ? '' : '\n'}`;
+    });
   }
 
   return { messages: sorted, text, edited };

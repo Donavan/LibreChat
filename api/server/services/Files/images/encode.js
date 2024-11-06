@@ -1,6 +1,12 @@
 const axios = require('axios');
-const { EModelEndpoint, FileSources } = require('librechat-data-provider');
-const { getStrategyFunctions } = require('../strategies');
+const {
+  FileSources,
+  VisionModes,
+  ImageDetail,
+  ContentTypes,
+  EModelEndpoint,
+} = require('librechat-data-provider');
+const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { logger } = require('~/config');
 
 /**
@@ -23,18 +29,33 @@ async function fetchImageToBase64(url) {
   }
 }
 
-const base64Only = new Set([EModelEndpoint.google, EModelEndpoint.anthropic]);
+const base64Only = new Set([
+  EModelEndpoint.google,
+  EModelEndpoint.anthropic,
+  'Ollama',
+  'ollama',
+  EModelEndpoint.bedrock,
+]);
 
 /**
  * Encodes and formats the given files.
  * @param {Express.Request} req - The request object.
  * @param {Array<MongoFile>} files - The array of files to encode and format.
  * @param {EModelEndpoint} [endpoint] - Optional: The endpoint for the image.
+ * @param {string} [mode] - Optional: The endpoint mode for the image.
  * @returns {Promise<Object>} - A promise that resolves to the result object containing the encoded images and file details.
  */
-async function encodeAndFormat(req, files, endpoint) {
+async function encodeAndFormat(req, files, endpoint, mode) {
   const promises = [];
   const encodingMethods = {};
+  const result = {
+    files: [],
+    image_urls: [],
+  };
+
+  if (!files || !files.length) {
+    return result;
+  }
 
   for (let file of files) {
     const source = file.source ?? FileSources.local;
@@ -64,15 +85,10 @@ async function encodeAndFormat(req, files, endpoint) {
     promises.push(preparePayload(req, file));
   }
 
-  const detail = req.body.imageDetail ?? 'auto';
+  const detail = req.body.imageDetail ?? ImageDetail.auto;
 
   /** @type {Array<[MongoFile, string]>} */
   const formattedImages = await Promise.all(promises);
-
-  const result = {
-    files: [],
-    image_urls: [],
-  };
 
   for (const [file, imageContent] of formattedImages) {
     const fileMetadata = {
@@ -94,16 +110,28 @@ async function encodeAndFormat(req, files, endpoint) {
     }
 
     const imagePart = {
-      type: 'image_url',
+      type: ContentTypes.IMAGE_URL,
       image_url: {
         url: imageContent.startsWith('http')
           ? imageContent
-          : `data:image/webp;base64,${imageContent}`,
+          : `data:${file.type};base64,${imageContent}`,
         detail,
       },
     };
 
-    if (endpoint && endpoint === EModelEndpoint.google) {
+    if (mode === VisionModes.agents) {
+      result.image_urls.push(imagePart);
+      result.files.push(fileMetadata);
+      continue;
+    }
+
+    if (endpoint && endpoint === EModelEndpoint.google && mode === VisionModes.generative) {
+      delete imagePart.image_url;
+      imagePart.inlineData = {
+        mimeType: file.type,
+        data: imageContent,
+      };
+    } else if (endpoint && endpoint === EModelEndpoint.google) {
       imagePart.image_url = imagePart.image_url.url;
     } else if (endpoint && endpoint === EModelEndpoint.anthropic) {
       imagePart.type = 'image';

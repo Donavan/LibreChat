@@ -1,45 +1,56 @@
-import { useCallback } from 'react';
-import { EModelEndpoint, FileSources, defaultOrderQuery } from 'librechat-data-provider';
-import { useGetEndpointsQuery } from 'librechat-data-provider/react-query';
+import { useCallback, useRef } from 'react';
 import {
-  useSetRecoilState,
-  useResetRecoilState,
-  useRecoilCallback,
-  useRecoilState,
-  useRecoilValue,
-} from 'recoil';
+  useGetModelsQuery,
+  useGetStartupConfig,
+  useGetEndpointsQuery,
+} from 'librechat-data-provider/react-query';
+import { useNavigate } from 'react-router-dom';
+import {
+  Constants,
+  FileSources,
+  isParamEndpoint,
+  LocalStorageKeys,
+  isAssistantsEndpoint,
+} from 'librechat-data-provider';
+import { useRecoilState, useRecoilValue, useSetRecoilState, useRecoilCallback } from 'recoil';
 import type {
-  TConversation,
-  TSubmission,
   TPreset,
+  TSubmission,
   TModelsConfig,
+  TConversation,
   TEndpointsConfig,
 } from 'librechat-data-provider';
+import type { AssistantListItem } from '~/common';
 import {
+  getEndpointField,
   buildDefaultConvo,
   getDefaultEndpoint,
-  getEndpointField,
+  getDefaultModelSpec,
+  getModelSpecIconURL,
   updateLastSelectedModel,
 } from '~/utils';
-import { useDeleteFilesMutation, useListAssistantsQuery } from '~/data-provider';
-import useOriginNavigate from './useOriginNavigate';
-import useSetStorage from './useSetStorage';
+import useAssistantListMap from './Assistants/useAssistantListMap';
+import { useDeleteFilesMutation } from '~/data-provider';
+import { usePauseGlobalAudio } from './Audio';
+import { mainTextareaId } from '~/common';
 import store from '~/store';
 
 const useNewConvo = (index = 0) => {
-  const setStorage = useSetStorage();
-  const navigate = useOriginNavigate();
+  const navigate = useNavigate();
+  const { data: startupConfig } = useGetStartupConfig();
+  const clearAllConversations = store.useClearConvoState();
   const defaultPreset = useRecoilValue(store.defaultPreset);
   const { setConversation } = store.useCreateConversationAtom(index);
   const [files, setFiles] = useRecoilState(store.filesByIndex(index));
+  const clearAllLatestMessages = store.useClearLatestMessages(`useNewConvo ${index}`);
   const setSubmission = useSetRecoilState<TSubmission | null>(store.submissionByIndex(index));
-  const resetLatestMessage = useResetRecoilState(store.latestMessageFamily(index));
   const { data: endpointsConfig = {} as TEndpointsConfig } = useGetEndpointsQuery();
 
-  const { data: assistants = [] } = useListAssistantsQuery(defaultOrderQuery, {
-    select: (res) =>
-      res.data.map(({ id, name, metadata, model }) => ({ id, name, metadata, model })),
-  });
+  const modelsQuery = useGetModelsQuery();
+  const timeoutIdRef = useRef<NodeJS.Timeout>();
+  const assistantsListMap = useAssistantListMap();
+  const { pauseGlobalAudio } = usePauseGlobalAudio(index);
+  const saveDrafts = useRecoilValue<boolean>(store.saveDrafts);
 
   const { mutateAsync } = useDeleteFilesMutation({
     onSuccess: () => {
@@ -51,17 +62,18 @@ const useNewConvo = (index = 0) => {
   });
 
   const switchToConversation = useRecoilCallback(
-    ({ snapshot }) =>
+    () =>
       async (
         conversation: TConversation,
         preset: Partial<TPreset> | null = null,
         modelsData?: TModelsConfig,
         buildDefault?: boolean,
         keepLatestMessage?: boolean,
+        keepAddedConvos?: boolean,
       ) => {
-        const modelsConfig = modelsData ?? snapshot.getLoadable(store.modelsConfig).contents;
+        const modelsConfig = modelsData ?? modelsQuery.data;
         const { endpoint = null } = conversation;
-        const buildDefaultConversation = endpoint === null || buildDefault;
+        const buildDefaultConversation = (endpoint === null || buildDefault) ?? false;
         const activePreset =
           // use default preset only when it's defined,
           // preset is not provided,
@@ -87,29 +99,34 @@ const useNewConvo = (index = 0) => {
             conversation.endpointType = undefined;
           }
 
-          const isAssistantEndpoint = defaultEndpoint === EModelEndpoint.assistants;
+          const isAssistantEndpoint = isAssistantsEndpoint(defaultEndpoint);
+          const assistants: AssistantListItem[] = assistantsListMap[defaultEndpoint] ?? [];
+          const currentAssistantId = conversation.assistant_id ?? '';
+          const currentAssistant = assistantsListMap[defaultEndpoint]?.[currentAssistantId] as
+            | AssistantListItem
+            | undefined;
 
-          if (!conversation.assistant_id && isAssistantEndpoint) {
-            conversation.assistant_id =
-              localStorage.getItem(`assistant_id__${index}`) ?? assistants[0]?.id;
+          if (currentAssistantId && !currentAssistant) {
+            conversation.assistant_id = undefined;
           }
 
-          if (
-            conversation.assistant_id &&
-            isAssistantEndpoint &&
-            conversation.conversationId === 'new'
-          ) {
-            const assistant = assistants.find(
-              (assistant) => assistant.id === conversation.assistant_id,
-            );
+          if (!currentAssistantId && isAssistantEndpoint) {
+            conversation.assistant_id =
+              localStorage.getItem(
+                `${LocalStorageKeys.ASST_ID_PREFIX}${index}${defaultEndpoint}`,
+              ) ?? assistants[0]?.id;
+          }
+
+          if (currentAssistantId && isAssistantEndpoint && conversation.conversationId === Constants.NEW_CONVO) {
+            const assistant = assistants.find((asst) => asst.id === currentAssistantId);
             conversation.model = assistant?.model;
             updateLastSelectedModel({
-              endpoint: EModelEndpoint.assistants,
+              endpoint: defaultEndpoint,
               model: conversation.model,
             });
           }
 
-          if (conversation.assistant_id && !isAssistantEndpoint) {
+          if (currentAssistantId && !isAssistantEndpoint) {
             conversation.assistant_id = undefined;
           }
 
@@ -122,40 +139,63 @@ const useNewConvo = (index = 0) => {
           });
         }
 
-        setStorage(conversation);
+        if (!(keepAddedConvos ?? false)) {
+          clearAllConversations(true);
+        }
         setConversation(conversation);
         setSubmission({} as TSubmission);
-        if (!keepLatestMessage) {
-          resetLatestMessage();
+        if (!(keepLatestMessage ?? false)) {
+          clearAllLatestMessages();
         }
 
-        if (conversation.conversationId === 'new' && !modelsData) {
-          const appTitle = localStorage.getItem('appTitle');
+        if (conversation.conversationId === Constants.NEW_CONVO && !modelsData) {
+          const appTitle = localStorage.getItem(LocalStorageKeys.APP_TITLE) ?? '';
           if (appTitle) {
             document.title = appTitle;
           }
-          navigate('new');
+          navigate(`/c/${Constants.NEW_CONVO}`);
         }
+
+        clearTimeout(timeoutIdRef.current);
+        timeoutIdRef.current = setTimeout(() => {
+          const textarea = document.getElementById(mainTextareaId);
+          if (textarea) {
+            textarea.focus();
+          }
+        }, 150);
       },
-    [endpointsConfig, defaultPreset, assistants],
+    [endpointsConfig, defaultPreset, assistantsListMap, modelsQuery.data],
   );
 
   const newConversation = useCallback(
     ({
-      template = {},
-      preset,
+      template: _template = {},
+      preset: _preset,
       modelsData,
       buildDefault = true,
       keepLatestMessage = false,
+      keepAddedConvos = false,
     }: {
       template?: Partial<TConversation>;
       preset?: Partial<TPreset>;
       modelsData?: TModelsConfig;
       buildDefault?: boolean;
       keepLatestMessage?: boolean;
+      keepAddedConvos?: boolean;
     } = {}) => {
+      pauseGlobalAudio();
+
+      const templateConvoId = _template.conversationId ?? '';
+      const paramEndpoint =
+        isParamEndpoint(_template.endpoint ?? '', _template.endpointType ?? '') === true ||
+        isParamEndpoint(_preset?.endpoint ?? '', _preset?.endpointType ?? '');
+      const template =
+        paramEndpoint === true && templateConvoId && templateConvoId === Constants.NEW_CONVO
+          ? { endpoint: _template.endpoint }
+          : _template;
+
       const conversation = {
-        conversationId: 'new',
+        conversationId: Constants.NEW_CONVO as string,
         title: 'New Chat',
         endpoint: null,
         ...template,
@@ -163,27 +203,64 @@ const useNewConvo = (index = 0) => {
         updatedAt: '',
       };
 
+      let preset = _preset;
+      const defaultModelSpec = getDefaultModelSpec(startupConfig?.modelSpecs?.list);
+      if (
+        !preset &&
+        startupConfig &&
+        startupConfig.modelSpecs?.prioritize === true &&
+        defaultModelSpec
+      ) {
+        preset = {
+          ...defaultModelSpec.preset,
+          iconURL: getModelSpecIconURL(defaultModelSpec),
+          spec: defaultModelSpec.name,
+        } as TConversation;
+      }
+
       if (conversation.conversationId === 'new' && !modelsData) {
         const filesToDelete = Array.from(files.values())
-          .filter((file) => file.filepath && file.source && !file.embedded && file.temp_file_id)
+          .filter(
+            (file) =>
+              file.filepath != null &&
+              file.filepath !== '' &&
+              file.source &&
+              !(file.embedded ?? false) &&
+              file.temp_file_id,
+          )
           .map((file) => ({
             file_id: file.file_id,
-            embedded: !!file.embedded,
+            embedded: !!(file.embedded ?? false),
             filepath: file.filepath as string,
             source: file.source as FileSources, // Ensure that the source is of type FileSources
           }));
 
         setFiles(new Map());
-        localStorage.setItem('filesToDelete', JSON.stringify({}));
+        localStorage.setItem(LocalStorageKeys.FILES_TO_DELETE, JSON.stringify({}));
 
-        if (filesToDelete.length > 0) {
+        if (!saveDrafts && filesToDelete.length > 0) {
           mutateAsync({ files: filesToDelete });
         }
       }
 
-      switchToConversation(conversation, preset, modelsData, buildDefault, keepLatestMessage);
+      switchToConversation(
+        conversation,
+        preset,
+        modelsData,
+        buildDefault,
+        keepLatestMessage,
+        keepAddedConvos,
+      );
     },
-    [switchToConversation, files, mutateAsync, setFiles],
+    [
+      pauseGlobalAudio,
+      startupConfig,
+      saveDrafts,
+      switchToConversation,
+      files,
+      setFiles,
+      mutateAsync,
+    ],
   );
 
   return {

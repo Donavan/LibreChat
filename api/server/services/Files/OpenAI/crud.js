@@ -7,16 +7,18 @@ const { logger } = require('~/config');
  * Uploads a file that can be used across various OpenAI services.
  *
  * @param {Object} params - The params object.
- * @param {Express.Request} params.req - The request object from Express. It should have a `user` property with an `id`
+ * @param {ServerRequest} params.req - The request object from Express. It should have a `user` property with an `id`
  *                       representing the user, and an `app.locals.paths` object with an `imageOutput` path.
  * @param {Express.Multer.File} params.file - The file uploaded to the server via multer.
  * @param {OpenAIClient} params.openai - The initialized OpenAI client.
  * @returns {Promise<OpenAIFile>}
  */
 async function uploadOpenAIFile({ req, file, openai }) {
+  const { height, width } = req.body;
+  const isImage = height && width;
   const uploadedFile = await openai.files.create({
     file: fs.createReadStream(file.path),
-    purpose: FilePurpose.Assistants,
+    purpose: isImage ? FilePurpose.Vision : FilePurpose.Assistants,
   });
 
   logger.debug(
@@ -34,13 +36,13 @@ async function uploadOpenAIFile({ req, file, openai }) {
     await sleep(sleepTime);
   }
 
-  return uploadedFile;
+  return isImage ? { ...uploadedFile, height, width } : uploadedFile;
 }
 
 /**
  * Deletes a file previously uploaded to OpenAI.
  *
- * @param {Express.Request} req - The request object from Express.
+ * @param {ServerRequest} req - The request object from Express.
  * @param {MongoFile} file - The database representation of the uploaded file.
  * @param {OpenAI} openai - The initialized OpenAI client.
  * @returns {Promise<void>}

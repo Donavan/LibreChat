@@ -1,15 +1,19 @@
+const throttle = require('lodash/throttle');
 const {
+  Time,
+  CacheKeys,
   StepTypes,
   ContentTypes,
   ToolCallTypes,
-  // StepStatus,
   MessageContentTypes,
   AssistantStreamEvents,
+  Constants,
 } = require('librechat-data-provider');
 const { retrieveAndProcessFile } = require('~/server/services/Files/process');
 const { processRequiredActions } = require('~/server/services/ToolService');
-const { createOnProgress, sendMessage } = require('~/server/utils');
+const { createOnProgress, sendMessage, sleep } = require('~/server/utils');
 const { processMessages } = require('~/server/services/Threads');
+const { getLogStores } = require('~/cache');
 const { logger } = require('~/config');
 
 /**
@@ -43,6 +47,8 @@ class StreamRunManager {
     /** @type {string} */
     this.apiKey = this.openai.apiKey;
     /** @type {string} */
+    this.parentMessageId = fields.parentMessageId;
+    /** @type {string} */
     this.thread_id = fields.thread_id;
     /** @type {RunCreateAndStreamParams} */
     this.initialRunBody = fields.runBody;
@@ -58,10 +64,14 @@ class StreamRunManager {
     this.messages = [];
     /** @type {string} */
     this.text = '';
+    /** @type {string} */
+    this.intermediateText = '';
     /** @type {Set<string>} */
     this.attachedFileIds = fields.attachedFileIds;
     /** @type {undefined | Promise<ChatCompletion>} */
     this.visionPromise = fields.visionPromise;
+    /** @type {number} */
+    this.streamRate = fields.streamRate ?? Constants.DEFAULT_STREAM_RATE;
 
     /**
      * @type {Object.<AssistantStreamEvents, (event: AssistantStreamEvent) => Promise<void>>}
@@ -121,6 +131,33 @@ class StreamRunManager {
     };
 
     sendMessage(this.res, contentData);
+  }
+
+  /* <------------------ Misc. Helpers ------------------> */
+  /** Returns the latest intermediate text
+   * @returns {string}
+   */
+  getText() {
+    return this.intermediateText;
+  }
+
+  /** Returns the current, intermediate message
+   * @returns {TMessage}
+   */
+  getIntermediateMessage() {
+    return {
+      conversationId: this.finalMessage.conversationId,
+      messageId: this.finalMessage.messageId,
+      parentMessageId: this.parentMessageId,
+      model: this.req.body.assistant_id,
+      endpoint: this.req.body.endpoint,
+      isCreatedByUser: false,
+      user: this.req.user.id,
+      text: this.getText(),
+      sender: 'Assistant',
+      unfinished: true,
+      error: false,
+    };
   }
 
   /* <------------------ Main Event Handlers ------------------> */
@@ -292,7 +329,7 @@ class StreamRunManager {
           }
         } else if (typeof delta[key] === 'string' && typeof data[key] === 'string') {
           // Concatenate strings
-          data[key] += delta[key];
+          // data[key] += delta[key];
         } else if (
           typeof delta[key] === 'object' &&
           delta[key] !== null &&
@@ -312,6 +349,8 @@ class StreamRunManager {
           type: ContentTypes.TOOL_CALL,
           index,
         });
+
+        await sleep(this.streamRate);
       }
     };
 
@@ -392,7 +431,7 @@ class StreamRunManager {
 
       const toolCallDelta = toolCall[toolCall.type];
       const progressCallback = this.progressCallbacks.get(stepKey);
-      await progressCallback(toolCallDelta);
+      progressCallback(toolCallDelta);
     }
   }
 
@@ -407,7 +446,9 @@ class StreamRunManager {
     const content = message.delta.content?.[0];
 
     if (content && content.type === MessageContentTypes.TEXT) {
+      this.intermediateText += content.text.value;
       onProgress(content.text.value);
+      await sleep(this.streamRate);
     }
   }
 
@@ -461,6 +502,34 @@ class StreamRunManager {
     return `${stepId}_tool_call_${toolCall.index}_${toolCall.type}`;
   }
 
+  /**
+   * Check Missing Outputs
+   * @param {ToolOutput[]} tool_outputs - The tool outputs.
+   * @param {RequiredAction[]} actions - The required actions.
+   * @returns {ToolOutput[]} completeOutputs - The complete outputs.
+   */
+  checkMissingOutputs(tool_outputs, actions) {
+    const missingOutputs = [];
+
+    for (const item of actions) {
+      const { tool, toolCallId, run_id, thread_id } = item;
+      const outputExists = tool_outputs.some((output) => output.tool_call_id === toolCallId);
+
+      if (!outputExists) {
+        logger.warn(
+          `The "${tool}" tool (ID: ${toolCallId}) failed to produce an output. run_id: ${run_id} thread_id: ${thread_id}`,
+        );
+        missingOutputs.push({
+          tool_call_id: toolCallId,
+          output:
+            'The tool failed to produce an output. The tool may not be currently available or experienced an unhandled error.',
+        });
+      }
+    }
+
+    return [...tool_outputs, ...missingOutputs];
+  }
+
   /* <------------------ Run Event handlers ------------------> */
 
   /**
@@ -483,7 +552,8 @@ class StreamRunManager {
       };
     });
 
-    const { tool_outputs } = await processRequiredActions(this, actions);
+    const { tool_outputs: preliminaryOutputs } = await processRequiredActions(this, actions);
+    const tool_outputs = this.checkMissingOutputs(preliminaryOutputs, actions);
     /** @type {AssistantStream | undefined} */
     let toolRun;
     try {
@@ -523,10 +593,17 @@ class StreamRunManager {
       const stepKey = message_creation.message_id;
       const index = this.getStepIndex(stepKey);
       this.orderedRunSteps.set(index, message_creation);
+
+      const messageCache = getLogStores(CacheKeys.MESSAGES);
       // Create the Factory Function to stream the message
       const { onProgress: progressCallback } = createOnProgress({
-        // todo: add option to save partialText to db
-        // onProgress: () => {},
+        onProgress: throttle(
+          () => {
+            messageCache.set(this.finalMessage.messageId, this.getText(), Time.FIVE_MINUTES);
+          },
+          3000,
+          { trailing: false },
+        ),
       });
 
       // This creates a function that attaches all of the parameters

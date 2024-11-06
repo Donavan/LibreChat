@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
-const { StructuredTool } = require('langchain/tools');
 const { zodToJsonSchema } = require('zod-to-json-schema');
 const { Calculator } = require('langchain/tools/calculator');
+const { tool: toolFn, Tool } = require('@langchain/core/tools');
 const {
   Tools,
   ContentTypes,
@@ -20,6 +20,14 @@ const { redactMessage } = require('~/config/parsers');
 const { sleep } = require('~/server/utils');
 const { logger } = require('~/config');
 
+const filteredTools = new Set([
+  'ChatTool.js',
+  'CodeSherpa.js',
+  'CodeSherpaTools.js',
+  'E2BTools.js',
+  'extractionChain.js',
+]);
+
 /**
  * Loads and formats tools from the specified tool directory.
  *
@@ -30,57 +38,70 @@ const { logger } = require('~/config');
  *
  * @param {object} params - The parameters for the function.
  * @param {string} params.directory - The directory path where the tools are located.
- * @param {Set<string>} [params.filter=new Set()] - A set of filenames to exclude from loading.
+ * @param {Array<string>} [params.adminFilter=[]] - Array of admin-defined tool keys to exclude from loading.
+ * @param {Array<string>} [params.adminIncluded=[]] - Array of admin-defined tool keys to include from loading.
  * @returns {Record<string, FunctionTool>} An object mapping each tool's plugin key to its instance.
  */
-function loadAndFormatTools({ directory, filter = new Set() }) {
+function loadAndFormatTools({ directory, adminFilter = [], adminIncluded = [] }) {
+  const filter = new Set([...adminFilter, ...filteredTools]);
+  const included = new Set(adminIncluded);
   const tools = [];
   /* Structured Tools Directory */
   const files = fs.readdirSync(directory);
 
-  for (const file of files) {
-    if (file.endsWith('.js') && !filter.has(file)) {
-      const filePath = path.join(directory, file);
-      let ToolClass = null;
-      try {
-        ToolClass = require(filePath);
-      } catch (error) {
-        logger.error(`[loadAndFormatTools] Error loading tool from ${filePath}:`, error);
-        continue;
-      }
-
-      if (!ToolClass) {
-        continue;
-      }
-
-      if (ToolClass.prototype instanceof StructuredTool) {
-        /** @type {StructuredTool | null} */
-        let toolInstance = null;
-        try {
-          toolInstance = new ToolClass({ override: true });
-        } catch (error) {
-          logger.error(
-            `[loadAndFormatTools] Error initializing \`${file}\` tool; if it requires authentication, is the \`override\` field configured?`,
-            error,
-          );
-          continue;
-        }
-
-        if (!toolInstance) {
-          continue;
-        }
-
-        const formattedTool = formatToOpenAIAssistantTool(toolInstance);
-        tools.push(formattedTool);
-      }
-    }
+  if (included.size > 0 && adminFilter.length > 0) {
+    logger.warn(
+      'Both `includedTools` and `filteredTools` are defined; `filteredTools` will be ignored.',
+    );
   }
 
-  /**
-   * Basic Tools; schema: { input: string }
-   */
-  const basicToolInstances = [new Calculator()];
+  for (const file of files) {
+    const filePath = path.join(directory, file);
+    if (!file.endsWith('.js') || (filter.has(file) && included.size === 0)) {
+      continue;
+    }
 
+    let ToolClass = null;
+    try {
+      ToolClass = require(filePath);
+    } catch (error) {
+      logger.error(`[loadAndFormatTools] Error loading tool from ${filePath}:`, error);
+      continue;
+    }
+
+    if (!ToolClass || !(ToolClass.prototype instanceof Tool)) {
+      continue;
+    }
+
+    let toolInstance = null;
+    try {
+      toolInstance = new ToolClass({ override: true });
+    } catch (error) {
+      logger.error(
+        `[loadAndFormatTools] Error initializing \`${file}\` tool; if it requires authentication, is the \`override\` field configured?`,
+        error,
+      );
+      continue;
+    }
+
+    if (!toolInstance) {
+      continue;
+    }
+
+    if (filter.has(toolInstance.name) && included.size === 0) {
+      continue;
+    }
+
+    if (included.size > 0 && !included.has(file) && !included.has(toolInstance.name)) {
+      continue;
+    }
+
+    const formattedTool = formatToOpenAIAssistantTool(toolInstance);
+    tools.push(formattedTool);
+  }
+
+  /** Basic Tools; schema: { input: string } */
+  const basicToolInstances = [new Calculator()];
   for (const toolInstance of basicToolInstances) {
     const formattedTool = formatToOpenAIAssistantTool(toolInstance);
     tools.push(formattedTool);
@@ -130,7 +151,7 @@ const processVisionRequest = async (client, currentAction) => {
 
   /** @type {ChatCompletion | undefined} */
   const completion = await client.visionPromise;
-  if (completion.usage) {
+  if (completion && completion.usage) {
     recordUsage({
       user: client.req.user.id,
       model: client.req.body.model,
@@ -159,7 +180,7 @@ async function processRequiredActions(client, requiredActions) {
   const tools = requiredActions.map((action) => action.tool);
   const loadedTools = await loadTools({
     user: client.req.user.id,
-    model: client.req.body.model ?? 'gpt-3.5-turbo-1106',
+    model: client.req.body.model ?? 'gpt-4o-mini',
     tools,
     functions: true,
     options: {
@@ -274,9 +295,16 @@ async function processRequiredActions(client, requiredActions) {
           })) ?? [];
       }
 
-      const actionSet = actionSets.find((action) =>
-        currentAction.tool.includes(domainParser(client.req, action.metadata.domain, true)),
-      );
+      let actionSet = null;
+      let currentDomain = '';
+      for (let action of actionSets) {
+        const domain = await domainParser(client.req, action.metadata.domain, true);
+        if (currentAction.tool.includes(domain)) {
+          currentDomain = domain;
+          actionSet = action;
+          break;
+        }
+      }
 
       if (!actionSet) {
         // TODO: try `function` if no action set is found
@@ -298,10 +326,8 @@ async function processRequiredActions(client, requiredActions) {
         builders = requestBuilders;
       }
 
-      const functionName = currentAction.tool.replace(
-        `${actionDelimiter}${domainParser(client.req, actionSet.metadata.domain, true)}`,
-        '',
-      );
+      const functionName = currentAction.tool.replace(`${actionDelimiter}${currentDomain}`, '');
+
       const requestBuilder = builders[functionName];
 
       if (!requestBuilder) {
@@ -309,7 +335,7 @@ async function processRequiredActions(client, requiredActions) {
         continue;
       }
 
-      tool = createActionTool({ action: actionSet, requestBuilder });
+      tool = await createActionTool({ action: actionSet, requestBuilder });
       isActionTool = !!tool;
       ActionToolMap[currentAction.tool] = tool;
     }
@@ -318,29 +344,26 @@ async function processRequiredActions(client, requiredActions) {
       currentAction.toolInput = currentAction.toolInput.input;
     }
 
-    try {
-      const promise = tool
-        ._call(currentAction.toolInput)
-        .then(handleToolOutput)
-        .catch((error) => {
-          logger.error(`Error processing tool ${currentAction.tool}`, error);
-          return {
-            tool_call_id: currentAction.toolCallId,
-            output: `Error processing tool ${currentAction.tool}: ${redactMessage(error.message)}`,
-          };
-        });
-      promises.push(promise);
-    } catch (error) {
+    const handleToolError = (error) => {
       logger.error(
         `tool_call_id: ${currentAction.toolCallId} | Error processing tool ${currentAction.tool}`,
         error,
       );
-      promises.push(
-        Promise.resolve({
-          tool_call_id: currentAction.toolCallId,
-          error: error.message,
-        }),
-      );
+      return {
+        tool_call_id: currentAction.toolCallId,
+        output: `Error processing tool ${currentAction.tool}: ${redactMessage(error.message, 256)}`,
+      };
+    };
+
+    try {
+      const promise = tool
+        ._call(currentAction.toolInput)
+        .then(handleToolOutput)
+        .catch(handleToolError);
+      promises.push(promise);
+    } catch (error) {
+      const toolOutputError = handleToolError(error);
+      promises.push(Promise.resolve(toolOutputError));
     }
   }
 
@@ -349,8 +372,124 @@ async function processRequiredActions(client, requiredActions) {
   };
 }
 
+/**
+ * Processes the runtime tool calls and returns the tool classes.
+ * @param {Object} params - Run params containing user and request information.
+ * @param {ServerRequest} params.req - The request object.
+ * @param {string} params.agent_id - The agent ID.
+ * @param {Agent['tools']} params.tools - The agent's available tools.
+ * @param {Agent['tool_resources']} params.tool_resources - The agent's available tool resources.
+ * @param {string | undefined} [params.openAIApiKey] - The OpenAI API key.
+ * @returns {Promise<{ tools?: StructuredTool[] }>} The agent tools.
+ */
+async function loadAgentTools({ req, agent_id, tools, tool_resources, openAIApiKey }) {
+  if (!tools || tools.length === 0) {
+    return {};
+  }
+  const loadedTools = await loadTools({
+    user: req.user.id,
+    // model: req.body.model ?? 'gpt-4o-mini',
+    tools,
+    functions: true,
+    options: {
+      req,
+      openAIApiKey,
+      tool_resources,
+      returnMetadata: true,
+      processFileURL,
+      uploadImageBuffer,
+      fileStrategy: req.app.locals.fileStrategy,
+    },
+    skipSpecs: true,
+  });
+
+  const agentTools = [];
+  for (let i = 0; i < loadedTools.length; i++) {
+    const tool = loadedTools[i];
+    if (tool.name && (tool.name === Tools.execute_code || tool.name === Tools.file_search)) {
+      agentTools.push(tool);
+      continue;
+    }
+
+    const toolInstance = toolFn(
+      async (...args) => {
+        return tool['_call'](...args);
+      },
+      {
+        name: tool.name,
+        description: tool.description,
+        schema: tool.schema,
+      },
+    );
+
+    agentTools.push(toolInstance);
+  }
+
+  const ToolMap = loadedTools.reduce((map, tool) => {
+    map[tool.name] = tool;
+    return map;
+  }, {});
+
+  let actionSets = [];
+  const ActionToolMap = {};
+
+  for (const toolName of tools) {
+    if (!ToolMap[toolName]) {
+      if (!actionSets.length) {
+        actionSets = (await loadActionSets({ agent_id })) ?? [];
+      }
+
+      let actionSet = null;
+      let currentDomain = '';
+      for (let action of actionSets) {
+        const domain = await domainParser(req, action.metadata.domain, true);
+        if (toolName.includes(domain)) {
+          currentDomain = domain;
+          actionSet = action;
+          break;
+        }
+      }
+
+      if (actionSet) {
+        const validationResult = validateAndParseOpenAPISpec(actionSet.metadata.raw_spec);
+        if (validationResult.spec) {
+          const { requestBuilders, functionSignatures, zodSchemas } = openapiToFunction(
+            validationResult.spec,
+            true,
+          );
+          const functionName = toolName.replace(`${actionDelimiter}${currentDomain}`, '');
+          const functionSig = functionSignatures.find((sig) => sig.name === functionName);
+          const requestBuilder = requestBuilders[functionName];
+          const zodSchema = zodSchemas[functionName];
+
+          if (requestBuilder) {
+            const tool = await createActionTool({
+              action: actionSet,
+              requestBuilder,
+              zodSchema,
+              name: toolName,
+              description: functionSig.description,
+            });
+            agentTools.push(tool);
+            ActionToolMap[toolName] = tool;
+          }
+        }
+      }
+    }
+  }
+
+  if (tools.length > 0 && agentTools.length === 0) {
+    throw new Error('No tools found for the specified tool calls.');
+  }
+
+  return {
+    tools: agentTools,
+  };
+}
+
 module.exports = {
-  formatToOpenAIAssistantTool,
+  loadAgentTools,
   loadAndFormatTools,
   processRequiredActions,
+  formatToOpenAIAssistantTool,
 };

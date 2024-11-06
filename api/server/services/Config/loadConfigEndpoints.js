@@ -1,6 +1,6 @@
 const { EModelEndpoint, extractEnvVariable } = require('librechat-data-provider');
+const { getCustomConfig } = require('./getCustomConfig');
 const { isUserProvided } = require('~/server/utils');
-const getCustomConfig = require('./getCustomConfig');
 
 /**
  * Load config endpoints from the cached configuration object
@@ -53,7 +53,7 @@ async function loadConfigEndpoints(req) {
 
   if (req.app.locals[EModelEndpoint.azureOpenAI]?.assistants) {
     /** @type {Omit<TConfig, 'order'>} */
-    endpointsConfig[EModelEndpoint.assistants] = {
+    endpointsConfig[EModelEndpoint.azureAssistants] = {
       userProvide: false,
     };
   }

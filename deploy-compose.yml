@@ -30,11 +30,9 @@ services:
         target: /app/librechat.yaml
       - ./images:/app/client/public/images
       - ./logs:/app/api/logs
+
   client:
-    build:
-      context: .
-      dockerfile: Dockerfile.multi
-      target: prod-stage
+    image: nginx:1.27.0-alpine
     container_name: LibreChat-NGINX
     ports:
       - 80:80
@@ -56,6 +54,7 @@ services:
   meilisearch:
     container_name: chat-meilisearch
     image: getmeili/meilisearch:v1.7.3
+    restart: always
     # ports: # Uncomment this to access meilisearch from outside docker
     #   - 7700:7700 # if exposing these ports, make sure your master key is not the default value
     env_file:

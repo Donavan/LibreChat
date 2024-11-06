@@ -1,105 +1,155 @@
 import { Plus } from 'lucide-react';
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useMemo } from 'react';
 import {
-  defaultAssistantFormValues,
-  defaultOrderQuery,
-  isImageVisionTool,
-  EModelEndpoint,
-  Capabilities,
+  Tools,
   FileSources,
+  Capabilities,
+  EModelEndpoint,
+  LocalStorageKeys,
+  isImageVisionTool,
+  defaultAssistantFormValues,
 } from 'librechat-data-provider';
 import type { UseFormReset } from 'react-hook-form';
 import type { UseMutationResult } from '@tanstack/react-query';
-import type { Assistant, AssistantCreateParams } from 'librechat-data-provider';
 import type {
-  AssistantForm,
+  Assistant,
+  AssistantDocument,
+  AssistantsEndpoint,
+  AssistantCreateParams,
+} from 'librechat-data-provider';
+import type {
   Actions,
-  TAssistantOption,
   ExtendedFile,
+  AssistantForm,
+  TAssistantOption,
   LastSelectedModels,
 } from '~/common';
 import SelectDropDown from '~/components/ui/SelectDropDown';
 import { useListAssistantsQuery } from '~/data-provider';
 import { useLocalize, useLocalStorage } from '~/hooks';
+import { cn, createDropdownSetter } from '~/utils';
 import { useFileMapContext } from '~/Providers';
-import { cn } from '~/utils';
 
-const keys = new Set(['name', 'id', 'description', 'instructions', 'model']);
+const keys = new Set([
+  'name',
+  'id',
+  'description',
+  'instructions',
+  'conversation_starters',
+  'model',
+]);
 
 export default function AssistantSelect({
   reset,
   value,
+  endpoint,
+  documentsMap,
   selectedAssistant,
   setCurrentAssistantId,
   createMutation,
 }: {
   reset: UseFormReset<AssistantForm>;
   value: TAssistantOption;
+  endpoint: AssistantsEndpoint;
   selectedAssistant: string | null;
+  documentsMap: Map<string, AssistantDocument> | null;
   setCurrentAssistantId: React.Dispatch<React.SetStateAction<string | undefined>>;
   createMutation: UseMutationResult<Assistant, Error, AssistantCreateParams>;
 }) {
   const localize = useLocalize();
   const fileMap = useFileMapContext();
   const lastSelectedAssistant = useRef<string | null>(null);
-  const [lastSelectedModels] = useLocalStorage<LastSelectedModels>(
-    'lastSelectedModel',
+  const [lastSelectedModels] = useLocalStorage<LastSelectedModels | undefined>(
+    LocalStorageKeys.LAST_MODEL,
     {} as LastSelectedModels,
   );
 
-  const assistants = useListAssistantsQuery(defaultOrderQuery, {
+  const query = useListAssistantsQuery(endpoint, undefined, {
     select: (res) =>
       res.data.map((_assistant) => {
+        const source =
+          endpoint === EModelEndpoint.assistants ? FileSources.openai : FileSources.azure;
         const assistant = {
           ..._assistant,
-          label: _assistant?.name ?? '',
+          label: _assistant.name ?? '',
           value: _assistant.id,
-          files: _assistant?.file_ids ? ([] as Array<[string, ExtendedFile]>) : undefined,
+          files: _assistant.file_ids ? ([] as Array<[string, ExtendedFile]>) : undefined,
+          code_files: _assistant.tool_resources?.code_interpreter?.file_ids
+            ? ([] as Array<[string, ExtendedFile]>)
+            : undefined,
+        };
+
+        const handleFile = (file_id: string, list?: Array<[string, ExtendedFile]>) => {
+          const file = fileMap?.[file_id];
+          if (file) {
+            list?.push([
+              file_id,
+              {
+                file_id: file.file_id,
+                type: file.type,
+                filepath: file.filepath,
+                filename: file.filename,
+                width: file.width,
+                height: file.height,
+                size: file.bytes,
+                preview: file.filepath,
+                progress: 1,
+                source,
+              },
+            ]);
+          } else {
+            list?.push([
+              file_id,
+              {
+                file_id,
+                type: '',
+                filename: '',
+                size: 1,
+                progress: 1,
+                filepath: endpoint,
+                source,
+              },
+            ]);
+          }
         };
 
         if (assistant.files && _assistant.file_ids) {
-          _assistant.file_ids.forEach((file_id) => {
-            const file = fileMap?.[file_id];
-            if (file) {
-              assistant.files?.push([
-                file_id,
-                {
-                  file_id: file.file_id,
-                  type: file.type,
-                  filepath: file.filepath,
-                  filename: file.filename,
-                  width: file.width,
-                  height: file.height,
-                  size: file.bytes,
-                  preview: file.filepath,
-                  progress: 1,
-                  source: FileSources.openai,
-                },
-              ]);
-            }
-          });
+          _assistant.file_ids.forEach((file_id) => handleFile(file_id, assistant.files));
         }
+
+        if (assistant.code_files && _assistant.tool_resources?.code_interpreter?.file_ids) {
+          _assistant.tool_resources.code_interpreter.file_ids.forEach((file_id) =>
+            handleFile(file_id, assistant.code_files),
+          );
+        }
+
+        const assistantDoc = documentsMap?.get(_assistant.id);
+        /* If no user updates, use the latest assistant docs */
+        if (assistantDoc && !assistant.conversation_starters) {
+          assistant.conversation_starters = assistantDoc.conversation_starters;
+        }
+
         return assistant;
       }),
   });
 
   const onSelect = useCallback(
     (value: string) => {
-      const assistant = assistants.data?.find((assistant) => assistant.id === value);
+      const assistant = query.data?.find((assistant) => assistant.id === value);
 
       createMutation.reset();
       if (!assistant) {
         setCurrentAssistantId(undefined);
         return reset({
           ...defaultAssistantFormValues,
-          model: lastSelectedModels?.[EModelEndpoint.assistants] ?? '',
+          model: lastSelectedModels?.[endpoint] ?? '',
         });
       }
 
       const update = {
         ...assistant,
-        label: assistant?.name ?? '',
-        value: assistant?.id ?? '',
+        label: assistant.name ?? '',
+        value: assistant.id ?? '',
       };
 
       const actions: Actions = {
@@ -108,17 +158,19 @@ export default function AssistantSelect({
         [Capabilities.retrieval]: false,
       };
 
-      assistant?.tools
-        ?.filter((tool) => tool.type !== 'function' || isImageVisionTool(tool))
-        ?.map((tool) => tool?.function?.name || tool.type)
+      (assistant.tools ?? [])
+        .filter((tool) => tool.type !== 'function' || isImageVisionTool(tool))
+        .map((tool) => tool.function?.name || tool.type)
         .forEach((tool) => {
+          if (tool === Tools.file_search) {
+            actions[Capabilities.retrieval] = true;
+          }
           actions[tool] = true;
         });
 
-      const functions =
-        assistant?.tools
-          ?.filter((tool) => tool.type === 'function' && !isImageVisionTool(tool))
-          ?.map((tool) => tool.function?.name ?? '') ?? [];
+      const functions = (assistant.tools ?? [])
+        .filter((tool) => tool.type === 'function' && !isImageVisionTool(tool))
+        .map((tool) => tool.function?.name ?? '');
 
       const formValues: Partial<AssistantForm & Actions> = {
         functions,
@@ -128,20 +180,28 @@ export default function AssistantSelect({
       };
 
       Object.entries(assistant).forEach(([name, value]) => {
-        if (typeof value === 'number') {
-          return;
-        } else if (typeof value === 'object') {
+        if (!keys.has(name)) {
           return;
         }
-        if (keys.has(name)) {
+
+        if (
+          name === 'conversation_starters' &&
+          Array.isArray(value) &&
+          value.every((item) => typeof item === 'string')
+        ) {
+          formValues[name] = value;
+          return;
+        }
+
+        if (typeof value !== 'number' && typeof value !== 'object') {
           formValues[name] = value;
         }
       });
 
       reset(formValues);
-      setCurrentAssistantId(assistant?.id);
+      setCurrentAssistantId(assistant.id);
     },
-    [assistants.data, reset, setCurrentAssistantId, createMutation, lastSelectedModels],
+    [query.data, reset, setCurrentAssistantId, createMutation, endpoint, lastSelectedModels],
   );
 
   useEffect(() => {
@@ -151,7 +211,7 @@ export default function AssistantSelect({
       return;
     }
 
-    if (selectedAssistant && assistants.data) {
+    if (selectedAssistant !== '' && selectedAssistant != null && query.data) {
       timerId = setTimeout(() => {
         lastSelectedAssistant.current = selectedAssistant;
         onSelect(selectedAssistant);
@@ -163,15 +223,15 @@ export default function AssistantSelect({
         clearTimeout(timerId);
       }
     };
-  }, [selectedAssistant, assistants.data, onSelect]);
+  }, [selectedAssistant, query.data, onSelect]);
 
   const createAssistant = localize('com_ui_create') + ' ' + localize('com_ui_assistant');
   return (
     <SelectDropDown
       value={!value ? createAssistant : value}
-      setValue={onSelect}
+      setValue={createDropdownSetter(onSelect)}
       availableValues={
-        assistants.data ?? [
+        query.data ?? [
           {
             label: 'Loading...',
             value: '',

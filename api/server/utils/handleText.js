@@ -1,4 +1,12 @@
-const { Capabilities, defaultRetrievalModels } = require('librechat-data-provider');
+const {
+  Capabilities,
+  EModelEndpoint,
+  isAgentsEndpoint,
+  AgentCapabilities,
+  isAssistantsEndpoint,
+  defaultRetrievalModels,
+  defaultAssistantsVersion,
+} = require('librechat-data-provider');
 const { getCitations, citeText } = require('./citations');
 const partialRight = require('lodash/partialRight');
 const { sendMessage } = require('./streamResponse');
@@ -6,33 +14,34 @@ const citationRegex = /\[\^\d+?\^]/g;
 
 const addSpaceIfNeeded = (text) => (text.length > 0 && !text.endsWith(' ') ? text + ' ' : text);
 
+const base = { message: true, initial: true };
 const createOnProgress = ({ generation = '', onProgress: _onProgress }) => {
   let i = 0;
   let tokens = addSpaceIfNeeded(generation);
 
-  const progressCallback = async (partial, { res, text, bing = false, ...rest }) => {
-    let chunk = partial === text ? '' : partial;
-    tokens += chunk;
-    tokens = tokens.replaceAll('[DONE]', '');
+  const basePayload = Object.assign({}, base, { text: tokens || '' });
 
-    if (bing) {
-      tokens = citeText(tokens, true);
+  const progressCallback = (chunk, { res, ...rest }) => {
+    basePayload.text = basePayload.text + chunk;
+
+    const payload = Object.assign({}, basePayload, rest);
+    sendMessage(res, payload);
+    if (_onProgress) {
+      _onProgress(payload);
     }
-
-    const payload = { text: tokens, message: true, initial: i === 0, ...rest };
-    sendMessage(res, { ...payload, text: tokens });
-    _onProgress && _onProgress(payload);
+    if (i === 0) {
+      basePayload.initial = false;
+    }
     i++;
   };
 
   const sendIntermediateMessage = (res, payload, extraTokens = '') => {
-    tokens += extraTokens;
-    sendMessage(res, {
-      text: tokens?.length === 0 ? '' : tokens,
-      message: true,
-      initial: i === 0,
-      ...payload,
-    });
+    basePayload.text = basePayload.text + extraTokens;
+    const message = Object.assign({}, basePayload, payload);
+    sendMessage(res, message);
+    if (i === 0) {
+      basePayload.initial = false;
+    }
     i++;
   };
 
@@ -41,7 +50,7 @@ const createOnProgress = ({ generation = '', onProgress: _onProgress }) => {
   };
 
   const getPartialText = () => {
-    return tokens;
+    return basePayload.text;
   };
 
   return { onProgress, getPartialText, sendIntermediateMessage };
@@ -153,10 +162,11 @@ const isUserProvided = (value) => value === 'user_provided';
 /**
  * Generate the configuration for a given key and base URL.
  * @param {string} key
- * @param {string} baseURL
+ * @param {string} [baseURL]
+ * @param {string} [endpoint]
  * @returns {boolean | { userProvide: boolean, userProvideURL?: boolean }}
  */
-function generateConfig(key, baseURL, assistants = false) {
+function generateConfig(key, baseURL, endpoint) {
   if (!key) {
     return false;
   }
@@ -168,6 +178,8 @@ function generateConfig(key, baseURL, assistants = false) {
     config.userProvideURL = isUserProvided(baseURL);
   }
 
+  const assistants = isAssistantsEndpoint(endpoint);
+  const agents = isAgentsEndpoint(endpoint);
   if (assistants) {
     config.retrievalModels = defaultRetrievalModels;
     config.capabilities = [
@@ -177,6 +189,24 @@ function generateConfig(key, baseURL, assistants = false) {
       Capabilities.actions,
       Capabilities.tools,
     ];
+  }
+
+  if (agents) {
+    config.capabilities = [
+      AgentCapabilities.file_search,
+      AgentCapabilities.actions,
+      AgentCapabilities.tools,
+    ];
+
+    if (key === 'EXPERIMENTAL_RUN_CODE') {
+      config.capabilities.push(AgentCapabilities.execute_code);
+    }
+  }
+
+  if (assistants && endpoint === EModelEndpoint.azureAssistants) {
+    config.version = defaultAssistantsVersion.azureAssistants;
+  } else if (assistants) {
+    config.version = defaultAssistantsVersion.assistants;
   }
 
   return config;

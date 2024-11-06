@@ -11,6 +11,7 @@ const messageSchema = mongoose.Schema(
     },
     conversationId: {
       type: String,
+      index: true,
       required: true,
       meiliIndex: true,
     },
@@ -110,6 +111,33 @@ const messageSchema = mongoose.Schema(
     thread_id: {
       type: String,
     },
+    /* frontend components */
+    iconURL: {
+      type: String,
+    },
+    attachments: { type: [{ type: mongoose.Schema.Types.Mixed }], default: undefined },
+    /*
+    attachments: {
+      type: [
+        {
+          file_id: String,
+          filename: String,
+          filepath: String,
+          expiresAt: Date,
+          width: Number,
+          height: Number,
+          type: String,
+          conversationId: String,
+          messageId: {
+            type: String,
+            required: true,
+          },
+          toolCallId: String,
+        },
+      ],
+      default: undefined,
+    },
+    */
   },
   { timestamps: true },
 );
@@ -124,7 +152,9 @@ if (process.env.MEILI_HOST && process.env.MEILI_MASTER_KEY) {
 }
 
 messageSchema.index({ createdAt: 1 });
+messageSchema.index({ messageId: 1, user: 1 }, { unique: true });
 
+/** @type {mongoose.Model<TMessage>} */
 const Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
 
 module.exports = Message;

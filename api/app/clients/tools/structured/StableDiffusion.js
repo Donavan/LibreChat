@@ -5,12 +5,12 @@ const path = require('path');
 const axios = require('axios');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
-const { StructuredTool } = require('langchain/tools');
+const { Tool } = require('@langchain/core/tools');
 const { FileContext } = require('librechat-data-provider');
 const paths = require('~/config/paths');
 const { logger } = require('~/config');
 
-class StableDiffusionAPI extends StructuredTool {
+class StableDiffusionAPI extends Tool {
   constructor(fields) {
     super();
     /** @type {string} User ID */
@@ -80,13 +80,18 @@ class StableDiffusionAPI extends StructuredTool {
     const payload = {
       prompt,
       negative_prompt,
-      sampler_index: 'DPM++ 2M Karras',
       cfg_scale: 4.5,
       steps: 22,
       width: 1024,
       height: 1024,
     };
-    const generationResponse = await axios.post(`${url}/sdapi/v1/txt2img`, payload);
+    let generationResponse;
+    try {
+      generationResponse = await axios.post(`${url}/sdapi/v1/txt2img`, payload);
+    } catch (error) {
+      logger.error('[StableDiffusion] Error while generating image:', error);
+      return 'Error making API request.';
+    }
     const image = generationResponse.data.images[0];
 
     /** @type {{ height: number, width: number, seed: number, infotexts: string[] }} */

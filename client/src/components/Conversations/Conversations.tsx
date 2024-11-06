@@ -2,6 +2,7 @@ import { useMemo, memo } from 'react';
 import { parseISO, isToday } from 'date-fns';
 import { TConversation } from 'librechat-data-provider';
 import { groupConversationsByDate } from '~/utils';
+import { useLocalize } from '~/hooks';
 import Convo from './Convo';
 
 const Conversations = ({
@@ -9,16 +10,19 @@ const Conversations = ({
   moveToTop,
   toggleNav,
 }: {
-  conversations: TConversation[];
+  conversations: Array<TConversation | null>;
   moveToTop: () => void;
   toggleNav: () => void;
 }) => {
+  const localize = useLocalize();
   const groupedConversations = useMemo(
     () => groupConversationsByDate(conversations),
     [conversations],
   );
   const firstTodayConvoId = useMemo(
-    () => conversations.find((convo) => isToday(parseISO(convo.updatedAt)))?.conversationId,
+    () =>
+      conversations.find((convo) => convo && convo.updatedAt && isToday(parseISO(convo.updatedAt)))
+        ?.conversationId,
     [conversations],
   );
 
@@ -29,15 +33,16 @@ const Conversations = ({
           {groupedConversations.map(([groupName, convos]) => (
             <div key={groupName}>
               <div
+                className="text-text-secondary"
                 style={{
-                  color: '#aaa',
                   fontSize: '0.7rem',
                   marginTop: '20px',
                   marginBottom: '5px',
                   paddingLeft: '10px',
                 }}
               >
-                {groupName}
+                {/* eslint-disable-next-line @typescript-eslint/strict-boolean-expressions */}
+                {localize(groupName) || groupName}
               </div>
               {convos.map((convo, i) => (
                 <Convo

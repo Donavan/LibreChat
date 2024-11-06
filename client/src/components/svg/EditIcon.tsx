@@ -1,15 +1,25 @@
-export default function EditIcon() {
+import React from 'react';
+import { cn } from '~/utils';
+
+type IconProps = {
+  className?: string;
+  size?: string;
+};
+
+const EditIcon = React.forwardRef<SVGSVGElement, IconProps>((props: IconProps, ref) => {
+  const { className = 'icon-md', size = '1.2em' } = props;
   return (
     <svg
+      ref={ref}
       fill="none"
       strokeWidth="2"
+      xmlns="http://www.w3.org/2000/svg"
       viewBox="0 0 24 24"
       strokeLinecap="round"
       strokeLinejoin="round"
-      className="h-4 w-4"
-      height="1em"
-      width="1em"
-      xmlns="http://www.w3.org/2000/svg"
+      height={size}
+      width={size}
+      className={cn(className)}
     >
       <path
         fillRule="evenodd"
@@ -19,4 +29,6 @@ export default function EditIcon() {
       ></path>
     </svg>
   );
-}
+});
+
+export default EditIcon;

@@ -8,7 +8,7 @@ const { logger } = require('~/config');
  * Deletes a file from the vector database. This function takes a file object, constructs the full path, and
  * verifies the path's validity before deleting the file. If the path is invalid, an error is thrown.
  *
- * @param {Express.Request} req - The request object from Express. It should have an `app.locals.paths` object with
+ * @param {ServerRequest} req - The request object from Express. It should have an `app.locals.paths` object with
  *                       a `publicPath` property.
  * @param {MongoFile} file - The file object to be deleted. It should have a `filepath` property that is
  *                           a string representing the path of the file relative to the publicPath.
@@ -18,9 +18,12 @@ const { logger } = require('~/config');
  *          file path is invalid or if there is an error in deletion.
  */
 const deleteVectors = async (req, file) => {
-  if (file.embedded && process.env.RAG_API_URL) {
+  if (!file.embedded || !process.env.RAG_API_URL) {
+    return;
+  }
+  try {
     const jwtToken = req.headers.authorization.split(' ')[1];
-    axios.delete(`${process.env.RAG_API_URL}/documents`, {
+    return await axios.delete(`${process.env.RAG_API_URL}/documents`, {
       headers: {
         Authorization: `Bearer ${jwtToken}`,
         'Content-Type': 'application/json',
@@ -28,6 +31,9 @@ const deleteVectors = async (req, file) => {
       },
       data: [file.file_id],
     });
+  } catch (error) {
+    logger.error('Error deleting vectors', error);
+    throw new Error(error.message || 'An error occurred during file deletion.');
   }
 };
 
